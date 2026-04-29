@@ -58,3 +58,24 @@ Because it is realistically not possible to reimplement all necessary hardware d
 Future implementations could in principle be built more natively.
 
 For message passing to be efficient, we kind of need a way to pass blobs between isolated processes without copying their content. This is normally easy to do with virtual memory/paging, but WebAssembly has no way to do that at the moment, and the committee is taking a long time to design things. Maybe WebAssembly isn't a good choice for this reason.
+
+# How interfaces work
+
+Two types of messages: requests, and notifications. Each request expects a single answer.
+
+Format of messages in CBOR.
+
+Requests include an opaque 64bits number that serves as identifier and is passed back in the response. In principle this could be an opaque piece of data, but it is good to guarantee that the recipient doesn't have to dynamically allocate memory to store these numbers.
+
+Communication is intentionally unidirectional. The recipient can never request things from the sender. Things like callbacks are implemented by having the sender send requests and the recipient answers these requests only when necessary.
+For example in order to read from a socket, you send "read" requests and the TCP code answers requests one after the other every time some data arrives on the socket.
+
+When it comes to the actual message mechanism, if we want something not terribly slow we need to use Wasm shared memory.
+We need a syscall that tells the kernel to open an IPC with a given destination, passing as parameter a pointer in memory. From the point of view of the Wasm program, it is as if this spawned a thread that reads/writes this memory.
+What the kernel does is share the memory with the other program.
+Then the two programs communicate with atomics.
+
+If a program is talking to several different other programs, they each individually have their own buffer of messages. Otherwise programs could corrupt each other.
+
+TODO: need to handle sleeping
+TODO: is it not problematic to have many different queues
