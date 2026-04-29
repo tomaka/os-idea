@@ -11,6 +11,10 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 #[unsafe(no_mangle)]
 extern "C" fn main(_argc: ffi::c_int, _argv: *const *const ffi::c_char) -> ffi::c_int {
+    unsafe {
+        syscalls::syscall!(syscalls::Sysno::clone); // TODO: dummy
+    }
+
     // TODO: do something
     0
 }

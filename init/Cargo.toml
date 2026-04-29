@@ -7,3 +7,4 @@ edition = "2024"
 panic = "abort"
 
 [dependencies]
+syscalls = { version = "0.8.1", default-features = false }
