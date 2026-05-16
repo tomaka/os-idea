@@ -10,5 +10,7 @@ fatfs = "0.3.6"
 flate2 = "1.0"
 fscommon = "0.1.1"
 futures-util = "0.3.32"
+gpt = "4.0"
 tar = "0.4.45"
 tokio = { version = "1.52", features = ["rt-multi-thread"] }
+uuid = "1"
