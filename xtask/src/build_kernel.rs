@@ -126,6 +126,9 @@ async fn actually_build_kernel(
                         cd /root/src && \
                         make O=/root/build defconfig && \
                         ./scripts/config --file /root/build/.config --enable CONFIG_EFI_STUB && \
+                        ./scripts/config --file /root/build/.config --enable BUILTIN_DTB && \
+                        ./scripts/config --file /root/build/.config --enable CMDLINE_BOOL && \
+                        ./scripts/config --file /root/build/.config --set-str CMDLINE "initrd=\initramfs.cpio.gz console=ttyS0" && \
                         make O=/root/build olddefconfig && \
                         make O=/root/build -j4 && \
                         echo "Compressing build artifacts" && \
@@ -177,15 +180,16 @@ async fn actually_build_kernel(
     {
         Ok(()) => {}
         Err(err) => {
-            let _ = docker
-                .remove_container(
-                    &container_id,
-                    Some(bollard::query_parameters::RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await;
+            // TODO: restore
+            /*let _ = docker
+            .remove_container(
+                &container_id,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;*/
             // TODO: print logs
             panic!("{err}"); // TODO: don't panic?
         }
