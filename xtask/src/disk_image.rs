@@ -12,8 +12,9 @@ pub fn build_disk_image(
         .truncate(true)
         .open(disk_image_path)?;
     file.set_len(512 * 1024 * 1024)?;
+    file.sync_data()?;
 
-    let (mut file, partition_size) = {
+    let (mut file, start_sector, sectors_length) = {
         gpt::mbr::ProtectiveMBR::with_lb_size(
             u32::try_from((512 * 1024 * 1024) / 512).unwrap() - 1,
         )
@@ -25,16 +26,18 @@ pub fn build_disk_image(
             .create_from_device(file, None)
             .unwrap(); // TODO: don't panic; convert error
 
-        let start_sector = 2048;
-        let (_, last_usable_sector) = disk
+        let (start_sector, sectors_length) = disk
             .find_free_sectors()
             .first()
             .copied()
             .ok_or_else(|| io::Error::other("No free sectors available"))?;
 
+        // TODO: not sure whether necessary
+        let sectors_length = ((sectors_length * 512) / 4096) * 4096 / 512;
+
         disk.add_partition(
             "boot",
-            (last_usable_sector - start_sector + 1) * 512,
+            sectors_length * 512,
             gpt::partition_types::EFI,
             0,
             None,
@@ -42,18 +45,23 @@ pub fn build_disk_image(
         .unwrap(); // TODO: don't panic; convert error
         let file = disk.write().unwrap(); // TODO: don't panic; convert error
 
-        (file, (last_usable_sector - start_sector + 1) * 512)
+        (file, start_sector, sectors_length)
     };
 
     {
-        // TODO: better offset calculation
-        let mut partition_slice =
-            fscommon::StreamSlice::new(&mut file, 2048 * 512, 2048 * 512 + partition_size)?;
+        let mut partition_slice = fscommon::StreamSlice::new(
+            &mut file,
+            start_sector * 512,
+            (start_sector + sectors_length) * 512,
+        )?;
 
         fatfs::format_volume(
             &mut partition_slice,
             fatfs::FormatVolumeOptions::new()
                 .fat_type(fatfs::FatType::Fat32)
+                .bytes_per_cluster(4096)
+                .bytes_per_sector(512)
+                .total_sectors(u32::try_from(sectors_length).unwrap())
                 .volume_label(*b"BOOT       "),
         )?;
 
@@ -62,11 +70,9 @@ pub fn build_disk_image(
 
             {
                 let root_dir = fs.root_dir();
-
-                let mut kernel_writer = root_dir
-                    .create_dir("EFI")?
-                    .create_dir("BOOT")?
-                    .create_file("BOOTX64.EFI")?;
+                let efi_dir = root_dir.create_dir("EFI")?;
+                let boot_dir = efi_dir.create_dir("BOOT")?;
+                let mut kernel_writer = boot_dir.create_file("BOOTX64.EFI")?;
                 io::copy(&mut fs::File::open(kernel_file_path)?, &mut kernel_writer)?;
 
                 let mut initramfs_writer = root_dir.create_file("initramfs.cpio.gz")?;
@@ -76,9 +82,12 @@ pub fn build_disk_image(
 
             fs.unmount()?;
         }
+
+        io::Write::flush(&mut partition_slice)?;
     }
 
     io::Write::flush(&mut file)?;
+    file.sync_data()?;
     Ok(())
 }
 
