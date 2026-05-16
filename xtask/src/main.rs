@@ -14,7 +14,7 @@ fn main() {
     build_kernel::build_kernel(&project_root).unwrap();
 
     let status = process::Command::new(env!("CARGO"))
-        .current_dir(&project_root)
+        .current_dir(project_root.join("init"))
         .args([
             "build",
             "--target",
@@ -31,11 +31,12 @@ fn main() {
     disk_image::build_disk_image(
         project_root.join("bzImage"),
         project_root
+            .join("init")
             .join("target")
             .join("x86_64-unknown-none")
             .join("debug")
             .join("init"),
-        "image.bin",
+        "image.img",
     )
     .unwrap();
 }
