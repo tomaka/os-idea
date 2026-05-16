@@ -13,10 +13,16 @@ pub fn build_disk_image(
         .open(disk_image_path)?;
     file.set_len(512 * 1024 * 1024)?;
 
-    let partition_size = {
+    let (mut file, partition_size) = {
+        gpt::mbr::ProtectiveMBR::with_lb_size(
+            u32::try_from((512 * 1024 * 1024) / 512).unwrap() - 1,
+        )
+        .overwrite_lba0(&mut file)
+        .unwrap(); // TODO: don't panic; convert error
+
         let mut disk = gpt::GptConfig::new()
             .writable(true)
-            .create_from_device(&mut file, None)
+            .create_from_device(file, None)
             .unwrap(); // TODO: don't panic; convert error
 
         let start_sector = 2048;
@@ -34,9 +40,9 @@ pub fn build_disk_image(
             None,
         )
         .unwrap(); // TODO: don't panic; convert error
-        disk.write().unwrap(); // TODO: don't panic; convert error
+        let file = disk.write().unwrap(); // TODO: don't panic; convert error
 
-        (last_usable_sector - start_sector + 1) * 512
+        (file, (last_usable_sector - start_sector + 1) * 512)
     };
 
     {
@@ -46,24 +52,29 @@ pub fn build_disk_image(
 
         fatfs::format_volume(
             &mut partition_slice,
-            // TODO: volume label
-            fatfs::FormatVolumeOptions::new().fat_type(fatfs::FatType::Fat32),
+            fatfs::FormatVolumeOptions::new()
+                .fat_type(fatfs::FatType::Fat32)
+                .volume_label(*b"BOOT       "),
         )?;
 
         {
             let fs = fatfs::FileSystem::new(&mut partition_slice, fatfs::FsOptions::new())?;
 
-            let root_dir = fs.root_dir();
+            {
+                let root_dir = fs.root_dir();
 
-            let mut kernel_writer = root_dir
-                .create_dir("EFI")?
-                .create_dir("BOOT")?
-                .create_file("BOOTX64.EFI")?;
-            io::copy(&mut fs::File::open(kernel_file_path)?, &mut kernel_writer)?;
+                let mut kernel_writer = root_dir
+                    .create_dir("EFI")?
+                    .create_dir("BOOT")?
+                    .create_file("BOOTX64.EFI")?;
+                io::copy(&mut fs::File::open(kernel_file_path)?, &mut kernel_writer)?;
 
-            let mut initramfs_writer = root_dir.create_file("initramfs.cpio.gz")?;
-            let init_program = fs::read(init_program_path)?;
-            io::Write::write_all(&mut initramfs_writer, &initramfs(&init_program))?;
+                let mut initramfs_writer = root_dir.create_file("initramfs.cpio.gz")?;
+                let init_program = fs::read(init_program_path)?;
+                io::Write::write_all(&mut initramfs_writer, &initramfs(&init_program))?;
+            }
+
+            fs.unmount()?;
         }
     }
 
