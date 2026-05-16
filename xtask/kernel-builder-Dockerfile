@@ -1,0 +1,21 @@
+FROM --platform=amd64 ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# See <https://kernelnewbies.org/KernelBuild>. Unfortunately many dependencies are missing from
+# that list.
+RUN apt-get update && apt-get install -y \
+    gcc \
+    make \
+    git \
+    exuberant-ctags \
+    bc \
+    libssl-dev \
+    flex \
+    bison \
+    libelf-dev \
+    tar \
+    gzip \
+    && rm -rf /var/lib/apt/lists/*
+
+CMD ["/bin/bash"]
