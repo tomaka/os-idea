@@ -130,7 +130,7 @@ fn initramfs(init_program: &[u8]) -> Vec<u8> {
 
     let mut writer = cpio::NewcBuilder::new("init")
         .ino(4)
-        .mode(0o100644)
+        .mode(0o100755)
         .write(&mut zip_encoder, u32::try_from(init_program.len()).unwrap());
     io::Write::write_all(&mut writer, init_program).unwrap();
     writer.finish().unwrap();
