@@ -10,3 +10,8 @@ panic = "abort"
 
 [dependencies]
 syscalls = { version = "0.8.1", default-features = false }
+cranelift-codegen = { version = "0.131.1", default-features = false, features = ["host-arch"] }
+#cranelift-wasm = { version = "0.112.3", default-features = false, features = ["core"] }            # TODO: doesn't compile on no_std
+target-lexicon = { version = "0.13.5", default-features = false }
+wasmparser = { version = "0.249.0", default-features = false }
+x25519-nostd = { version = "0.1.0", default-features = false }      # TODO: crate looks a bit sketchy compared to x25519-dalek, but x22519-dalek indeed triggers a LLVM error

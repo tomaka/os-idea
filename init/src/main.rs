@@ -11,8 +11,17 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 #[unsafe(no_mangle)]
 extern "C" fn _start(_argc: ffi::c_int, _argv: *const *const ffi::c_char) -> ffi::c_int {
-    let msg = "Hello world\n";
+    stdout("Hello world\n");
 
+    // Pause forever.
+    loop {
+        unsafe {
+            let _ = syscalls::syscall!(syscalls::Sysno::pause);
+        }
+    }
+}
+
+fn stdout(msg: &str) {
     unsafe {
         let _ = syscalls::syscall!(
             syscalls::Sysno::write,
@@ -20,12 +29,5 @@ extern "C" fn _start(_argc: ffi::c_int, _argv: *const *const ffi::c_char) -> ffi
             msg.as_ptr(),
             msg.len()
         );
-    }
-
-    // Pause forever.
-    loop {
-        unsafe {
-            let _ = syscalls::syscall!(syscalls::Sysno::pause);
-        }
     }
 }
