@@ -11,8 +11,8 @@ panic = "abort"
 
 [dependencies]
 allocator-api2 = { version = "0.4.0", default-features = false }
-cranelift-codegen = { version = "0.131.1", default-features = false, features = ["host-arch"] }
-cranelift-frontend = { version = "0.131.1", default-features = false, features = ["core"] }
+cranelift-codegen = { git = "https://github.com/tomaka/wasmtime", branch = "nostd", default-features = false, features = ["host-arch"] }
+cranelift-frontend = { git = "https://github.com/tomaka/wasmtime", branch = "nostd", default-features = false, features = ["core"] }
 syscalls = { version = "0.8.1", default-features = false }
 talc = "5.0.3"
 target-lexicon = { version = "0.13.5", default-features = false }
