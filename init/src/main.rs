@@ -11,12 +11,18 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 #[unsafe(no_mangle)]
 extern "C" fn _start(_argc: ffi::c_int, _argv: *const *const ffi::c_char) -> ffi::c_int {
+    let mut heap = [0u8; 10000];
+    let talc = talc::TalcCell::new(unsafe { talc::source::Claim::array(&raw mut heap) });
+
     stdout("Hello world\n");
 
-    test(&[
-        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,
-        0x03, 0x02, 0x01, 0x00, 0x0a, 0x09, 0x01, 0x07, 0x00, 0x41, 0x2a, 0x0b,
-    ]);
+    test(
+        &[
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60, 0x00, 0x01,
+            0x7f, 0x03, 0x02, 0x01, 0x00, 0x0a, 0x09, 0x01, 0x07, 0x00, 0x41, 0x2a, 0x0b,
+        ],
+        &talc,
+    );
 
     // Pause forever.
     loop {
@@ -37,7 +43,7 @@ fn stdout(msg: &str) {
     }
 }
 
-fn test(wasm_bytes: &[u8]) {
+fn test<A: allocator_api2::alloc::Allocator>(wasm_bytes: &[u8], allocator: A) {
     let mut func_bytecode: &[u8] = &[];
     let parser = wasmparser::Parser::new(0);
     for payload in parser.parse_all(wasm_bytes) {
@@ -72,7 +78,8 @@ fn test(wasm_bytes: &[u8]) {
     let mut code_memory = cranelift_codegen::binemit::CodeMemory::new();
     let compiled_info = context.compile(&*isa, &mut Default::default()).unwrap();
 
-    let mut machine_code_buffer = vec![0u8; compiled_info.code_size as usize];
+    let mut machine_code_buffer =
+        allocator_api2::vec![in allocator; 0u8; compiled_info.code_size as usize];
     unsafe {
         context.emit_to_memory(&*isa, machine_code_buffer.as_mut_ptr(), &mut code_memory);
     }
