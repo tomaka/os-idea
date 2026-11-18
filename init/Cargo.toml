@@ -11,10 +11,10 @@ panic = "abort"
 
 [dependencies]
 allocator-api2 = { version = "0.4.0", default-features = false }
-cranelift-codegen = { git = "https://github.com/tomaka/wasmtime", branch = "nostd", default-features = false, features = ["host-arch"] }
-cranelift-frontend = { git = "https://github.com/tomaka/wasmtime", branch = "nostd", default-features = false, features = ["core"] }
+cranelift-codegen = { version = "0.135.5", default-features = false, features = ["core", "x86"] }
+cranelift-frontend = { version = "0.135.5", default-features = false, features = ["core"] }
 syscalls = { version = "0.8.1", default-features = false }
 talc = "5.0.3"
 target-lexicon = { version = "0.13.5", default-features = false }
-wasmparser = { version = "0.249.0", default-features = false }
+wasmparser = { version = "0.249.0", default-features = false, features = ["validate", "features"] }
 x25519-nostd = { version = "0.1.0", default-features = false }      # TODO: crate looks a bit sketchy compared to x25519-dalek, but x22519-dalek indeed triggers a LLVM error

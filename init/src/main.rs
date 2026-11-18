@@ -1,7 +1,24 @@
 #![no_std]
 #![no_main]
 
-use core::ffi;
+extern crate alloc;
+
+use core::{ffi, mem::MaybeUninit};
+
+mod vm;
+
+#[global_allocator]
+static ALLOCATOR: talc::cell::TalcSyncCell<
+    talc::source::Claim,
+    talc::base::binning::DefaultBinning,
+> = unsafe {
+    static mut HEAP: [MaybeUninit<u8>; 16 * 1024 * 1024] =
+        [MaybeUninit::uninit(); 16 * 1024 * 1024];
+    // SAFETY: the init process is single-threaded.
+    talc::cell::TalcSyncCell::new(talc::TalcCell::new(talc::source::Claim::array(
+        &raw mut HEAP,
+    )))
+};
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
@@ -11,18 +28,12 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 #[unsafe(no_mangle)]
 extern "C" fn _start(_argc: ffi::c_int, _argv: *const *const ffi::c_char) -> ffi::c_int {
-    let mut heap = [0u8; 10000];
-    let talc = talc::TalcCell::new(unsafe { talc::source::Claim::array(&raw mut heap) });
-
     stdout("Hello world\n");
 
-    test(
-        &[
-            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60, 0x00, 0x01,
-            0x7f, 0x03, 0x02, 0x01, 0x00, 0x0a, 0x09, 0x01, 0x07, 0x00, 0x41, 0x2a, 0x0b,
-        ],
-        &talc,
-    );
+    match run_wasm(TEST_WASM) {
+        Ok(results) => stdout(&alloc::format!("Wasm returned {results:?}\n")),
+        Err(err) => stdout(&alloc::format!("Wasm error: {err}\n")),
+    }
 
     // Pause forever.
     loop {
@@ -43,44 +54,77 @@ fn stdout(msg: &str) {
     }
 }
 
-fn test<A: allocator_api2::alloc::Allocator>(wasm_bytes: &[u8], allocator: A) {
-    let mut func_bytecode: &[u8] = &[];
-    let parser = wasmparser::Parser::new(0);
-    for payload in parser.parse_all(wasm_bytes) {
-        if let Ok(wasmparser::Payload::CodeSectionEntry(code)) = payload {
-            func_bytecode = code.range().get(wasm_bytes).unwrap();
-        }
-    }
-
-    let mut flag_builder = cranelift_codegen::settings::builder();
-    flag_builder.set("opt_level", "speed").unwrap();
-
-    let isa = cranelift_codegen::isa::lookup(target_lexicon::triple!("x86_64"))
-        .unwrap()
-        .finish(cranelift_codegen::settings::Flags::new(flag_builder))
-        .unwrap();
-
-    let mut env = cranelift_wasm::DummyEnvironment::new(isa.frontend_config());
-
-    let mut clif_function = cranelift_codegen::ir::Function::new();
-    cranelift_wasm::FuncTranslator::new()
-        .translate(
-            &wasmparser::FunctionBody::new(0, func_bytecode),
-            0,
-            &mut clif_function,
-            &mut env,
-        )
-        .unwrap();
-
-    let mut context = cranelift_codegen::Context::new();
-    context.func = clif_function;
-
-    let mut code_memory = cranelift_codegen::binemit::CodeMemory::new();
-    let compiled_info = context.compile(&*isa, &mut Default::default()).unwrap();
-
-    let mut machine_code_buffer =
-        allocator_api2::vec![in allocator; 0u8; compiled_info.code_size as usize];
-    unsafe {
-        context.emit_to_memory(&*isa, machine_code_buffer.as_mut_ptr(), &mut code_memory);
-    }
+fn run_wasm(wasm_bytes: &[u8]) -> Result<alloc::vec::Vec<vm::Value>, vm::Error> {
+    let module = vm::Module::new(wasm_bytes)?;
+    let mut instance = vm::Instance::new(&module)?;
+    instance.call("main", &[])
 }
+
+/// Test program. Its `main` function returns 42 if everything works as expected.
+///
+/// Compiled from:
+///
+/// ```wat
+/// (module
+///   (memory 1)
+///   (global $counter (mut i32) (i32.const 0))
+///   (data (i32.const 16) "\05\00\00\00")
+///
+///   ;; Recursive factorial with a call.
+///   (func $fact (param i64) (result i64)
+///     (if (result i64) (i64.le_u (local.get 0) (i64.const 1))
+///       (then (i64.const 1))
+///       (else (i64.mul (local.get 0) (call $fact (i64.sub (local.get 0) (i64.const 1)))))))
+///
+///   ;; Iterative sum 1..=n using a loop, br_if and a global.
+///   (func $sum (param i32) (result i32) (local $acc i32)
+///     (block $done
+///       (loop $l
+///         (br_if $done (i32.eqz (local.get 0)))
+///         (global.set $counter (i32.add (global.get $counter) (i32.const 1)))
+///         (local.set $acc (i32.add (local.get $acc) (local.get 0)))
+///         (local.set 0 (i32.sub (local.get 0) (i32.const 1)))
+///         (br $l)))
+///     (local.get $acc))
+///
+///   ;; br_table based switch.
+///   (func $switch (param i32) (result i32)
+///     (block $c (block $b (block $a
+///       (br_table $a $b $c (local.get 0)))
+///       (return (i32.const 100)))
+///       (return (i32.const 200)))
+///     (i32.const 300))
+///
+///   ;; Expected: fact(10)=3628800, sum(n from memory @16 = 5) = 15, switch(1)=200, counter=5
+///   ;; Returns 42 if everything is correct, otherwise a non-42 code.
+///   (func (export "main") (result i32)
+///     (if (i64.ne (call $fact (i64.const 10)) (i64.const 3628800)) (then (return (i32.const 1))))
+///     (i32.store (i32.const 32) (call $sum (i32.load (i32.const 16))))
+///     (if (i32.ne (i32.load8_u (i32.const 32)) (i32.const 15)) (then (return (i32.const 2))))
+///     (if (i32.ne (call $switch (i32.const 1)) (i32.const 200)) (then (return (i32.const 3))))
+///     (if (i32.ne (call $switch (i32.const 7)) (i32.const 300)) (then (return (i32.const 4))))
+///     (if (i32.ne (global.get $counter) (i32.const 5)) (then (return (i32.const 5))))
+///     (i32.const 42))
+/// )
+/// ```
+#[rustfmt::skip]
+const TEST_WASM: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0f, 0x03, 0x60, 0x01, 0x7e,
+    0x01, 0x7e, 0x60, 0x01, 0x7f, 0x01, 0x7f, 0x60, 0x00, 0x01, 0x7f, 0x03, 0x05, 0x04,
+    0x00, 0x01, 0x01, 0x02, 0x05, 0x03, 0x01, 0x00, 0x01, 0x06, 0x06, 0x01, 0x7f, 0x01,
+    0x41, 0x00, 0x0b, 0x07, 0x08, 0x01, 0x04, 0x6d, 0x61, 0x69, 0x6e, 0x00, 0x03, 0x0a,
+    0xb6, 0x01, 0x04, 0x17, 0x00, 0x20, 0x00, 0x42, 0x01, 0x58, 0x04, 0x7e, 0x42, 0x01,
+    0x05, 0x20, 0x00, 0x20, 0x00, 0x42, 0x01, 0x7d, 0x10, 0x00, 0x7e, 0x0b, 0x0b, 0x28,
+    0x01, 0x01, 0x7f, 0x02, 0x40, 0x03, 0x40, 0x20, 0x00, 0x45, 0x0d, 0x01, 0x23, 0x00,
+    0x41, 0x01, 0x6a, 0x24, 0x00, 0x20, 0x01, 0x20, 0x00, 0x6a, 0x21, 0x01, 0x20, 0x00,
+    0x41, 0x01, 0x6b, 0x21, 0x00, 0x0c, 0x00, 0x0b, 0x0b, 0x20, 0x01, 0x0b, 0x1d, 0x00,
+    0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x20, 0x00, 0x0e, 0x02, 0x00, 0x01, 0x02, 0x0b,
+    0x41, 0xe4, 0x00, 0x0f, 0x0b, 0x41, 0xc8, 0x01, 0x0f, 0x0b, 0x41, 0xac, 0x02, 0x0b,
+    0x55, 0x00, 0x42, 0x0a, 0x10, 0x00, 0x42, 0x80, 0xbe, 0xdd, 0x01, 0x52, 0x04, 0x40,
+    0x41, 0x01, 0x0f, 0x0b, 0x41, 0x20, 0x41, 0x10, 0x28, 0x02, 0x00, 0x10, 0x01, 0x36,
+    0x02, 0x00, 0x41, 0x20, 0x2d, 0x00, 0x00, 0x41, 0x0f, 0x47, 0x04, 0x40, 0x41, 0x02,
+    0x0f, 0x0b, 0x41, 0x01, 0x10, 0x02, 0x41, 0xc8, 0x01, 0x47, 0x04, 0x40, 0x41, 0x03,
+    0x0f, 0x0b, 0x41, 0x07, 0x10, 0x02, 0x41, 0xac, 0x02, 0x47, 0x04, 0x40, 0x41, 0x04,
+    0x0f, 0x0b, 0x23, 0x00, 0x41, 0x05, 0x47, 0x04, 0x40, 0x41, 0x05, 0x0f, 0x0b, 0x41,
+    0x2a, 0x0b, 0x0b, 0x0a, 0x01, 0x00, 0x41, 0x10, 0x0b, 0x04, 0x05, 0x00, 0x00, 0x00,
+];
