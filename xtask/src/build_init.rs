@@ -3,7 +3,8 @@ use std::{fs, path::Path, path::PathBuf, process};
 /// Builds the init program and returns the path to the resulting executable.
 ///
 /// The `init` crate is a library. This function creates a temporary Cargo project that depends
-/// on it and whose `main` function calls `init::run()`, then builds that project.
+/// on it and whose `main` function calls `init::run()` with a randomly-generated secret key,
+/// then builds that project.
 /// The build artifacts are stored in the `target` directory at the root of the repository, so
 /// that they are kept between builds even though the temporary project is deleted.
 ///
@@ -39,9 +40,11 @@ pub fn build_init() -> PathBuf {
         .unwrap_or_else(|err| panic!("failed to write Cargo.toml: {err}"));
     fs::create_dir(tmp.path().join("src"))
         .unwrap_or_else(|err| panic!("failed to create src directory: {err}"));
+    // The `Debug` implementation of `[u8; 32]` produces a valid Rust array expression.
+    let secret_key = rand::random::<[u8; 32]>();
     fs::write(
         tmp.path().join("src").join("main.rs"),
-        "fn main() { init::run() }\n",
+        format!("fn main() {{ init::run({secret_key:?}) }}\n"),
     )
     .unwrap_or_else(|err| panic!("failed to write main.rs: {err}"));
     // Reuse the lock file of `init` so that dependency versions stay pinned.

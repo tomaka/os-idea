@@ -1,7 +1,9 @@
 mod vm;
 
 /// Entry point of the init program. Runs the tests and then pauses forever.
-pub fn run() -> ! {
+pub fn run(secret_key: [u8; 32]) -> ! {
+    let secret_key = x25519_dalek::StaticSecret::from(secret_key);
+
     println!("Hello world");
 
     // SAFETY: nothing else in this program installs signal handlers.
@@ -10,12 +12,36 @@ pub fn run() -> ! {
             for (name, wasm, expected) in [
                 ("general", TEST_WASM, Ok(vec![vm::Value::I32(42)])),
                 ("imports", TEST_IMPORTS_WASM, Ok(vec![vm::Value::I32(42)])),
-                ("unreachable", TEST_UNREACHABLE_WASM, Err(vm::Trap::Unreachable)),
-                ("division by zero", TEST_DIV_ZERO_WASM, Err(vm::Trap::DivisionByZero)),
-                ("division overflow", TEST_DIV_OVERFLOW_WASM, Err(vm::Trap::IntegerOverflow)),
-                ("remainder of overflow", TEST_REM_OVERFLOW_WASM, Ok(vec![vm::Value::I32(0)])),
-                ("out of bounds", TEST_OUT_OF_BOUNDS_WASM, Err(vm::Trap::OutOfBounds)),
-                ("stack overflow", TEST_STACK_OVERFLOW_WASM, Err(vm::Trap::StackOverflow)),
+                (
+                    "unreachable",
+                    TEST_UNREACHABLE_WASM,
+                    Err(vm::Trap::Unreachable),
+                ),
+                (
+                    "division by zero",
+                    TEST_DIV_ZERO_WASM,
+                    Err(vm::Trap::DivisionByZero),
+                ),
+                (
+                    "division overflow",
+                    TEST_DIV_OVERFLOW_WASM,
+                    Err(vm::Trap::IntegerOverflow),
+                ),
+                (
+                    "remainder of overflow",
+                    TEST_REM_OVERFLOW_WASM,
+                    Ok(vec![vm::Value::I32(0)]),
+                ),
+                (
+                    "out of bounds",
+                    TEST_OUT_OF_BOUNDS_WASM,
+                    Err(vm::Trap::OutOfBounds),
+                ),
+                (
+                    "stack overflow",
+                    TEST_STACK_OVERFLOW_WASM,
+                    Err(vm::Trap::StackOverflow),
+                ),
             ] {
                 let result = match run_wasm(&trap_handlers, wasm) {
                     Ok(values) => Ok(values),
