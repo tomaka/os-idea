@@ -24,7 +24,7 @@ use std::{
 pub fn build_kernel(project_root: impl AsRef<Path>) -> Result<PathBuf, io::Error> {
     let project_root = project_root.as_ref();
     let out_dir = project_root.join("target").join("kernel");
-    let kernel_tar = project_root.join("linux-7.0.tar.gz");
+    let kernel_tar = project_root.join("xtask").join("linux-7.0.tar.gz");
     let artifacts = out_dir.join("build-artifacts.tar.gz");
     let bzimage = out_dir.join("bzImage");
 
