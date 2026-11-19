@@ -31,7 +31,10 @@ pub fn build_kernel(project_root: impl AsRef<Path>) -> Result<PathBuf, io::Error
     let inputs = [
         kernel_tar.clone(),
         project_root.join("xtask").join("kernel-builder-Dockerfile"),
-        project_root.join("xtask").join("src").join("build_kernel.rs"),
+        project_root
+            .join("xtask")
+            .join("src")
+            .join("build_kernel.rs"),
     ];
     if is_up_to_date(&bzimage, &inputs)? {
         return Ok(bzimage);
@@ -39,22 +42,20 @@ pub fn build_kernel(project_root: impl AsRef<Path>) -> Result<PathBuf, io::Error
 
     fs::create_dir_all(&out_dir)?;
 
-    tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(async {
-            let docker = bollard::Docker::connect_with_local_defaults()
-                .expect("Failed to connect to Docker daemon");
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let docker = bollard::Docker::connect_with_local_defaults()
+            .expect("Failed to connect to Docker daemon");
 
-            // TODO: better image tag? don't use a tag at all?
-            build_image(&docker, "kernel-builder:latest".to_string()).await?;
-            actually_build_kernel(
-                &docker,
-                &kernel_tar,
-                &artifacts,
-                "kernel-builder:latest".to_string(),
-            )
-            .await
-        })?;
+        // TODO: better image tag? don't use a tag at all?
+        build_image(&docker, "kernel-builder:latest".to_string()).await?;
+        actually_build_kernel(
+            &docker,
+            &kernel_tar,
+            &artifacts,
+            "kernel-builder:latest".to_string(),
+        )
+        .await
+    })?;
 
     // The `bzImage` acts as the stamp file and is thus written last, atomically, so that an
     // interrupted build never leaves an up-to-date-looking `bzImage`.
@@ -163,6 +164,8 @@ async fn actually_build_kernel(
         cmd: Some(vec![
             "/bin/sh".to_owned(),
             "-c".to_owned(),
+            // Pass `sysctl.debug.exception-trace=0` to the kernel because the `init`
+            // program is expected to generate exceptions.
             format!(
                 r#"
                         mkdir -p /root/build && \
@@ -176,7 +179,7 @@ async fn actually_build_kernel(
                         ./scripts/config --file /root/build/.config --enable CONFIG_EFI_STUB && \
                         ./scripts/config --file /root/build/.config --enable BUILTIN_DTB && \
                         ./scripts/config --file /root/build/.config --enable CMDLINE_BOOL && \
-                        ./scripts/config --file /root/build/.config --set-str CMDLINE "initrd=\initramfs.cpio.gz console=ttyS0" && \
+                        ./scripts/config --file /root/build/.config --set-str CMDLINE "initrd=\initramfs.cpio.gz console=ttyS0 sysctl.debug.exception-trace=0" && \
                         make O=/root/build olddefconfig && \
                         make O=/root/build -j4 && \
                         echo "Compressing build artifacts" && \
