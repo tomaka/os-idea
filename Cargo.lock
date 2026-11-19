@@ -633,6 +633,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "interface-bindings"
+version = "0.1.0"
+dependencies = [
+ "interface-parser",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
+]
+
+[[package]]
 name = "interface-parser"
 version = "0.1.0"
 dependencies = [

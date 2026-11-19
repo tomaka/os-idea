@@ -1,0 +1,14 @@
+[package]
+name = "interface-bindings"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]
+interface-parser = { path = "../interface-parser" }
+proc-macro2 = "1.0.106"
+quote = "1.0.45"
+syn = { version = "3.0.4", features = ["parsing"] }

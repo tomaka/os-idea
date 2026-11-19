@@ -1,0 +1,21 @@
+message = [ store-request, store-response ]
+
+store-request = {
+    hash: bytes .size 32,
+    data: bytes,
+    ? name: tstr,
+    links: links,
+    priority: 0..10,
+    kind: kind,
+    tags: [ * tstr ],
+}
+
+store-response = {}
+
+links = {
+    * bytes .size 32 => uint
+}
+
+kind = small / large
+small = [ uint ]
+large = [ size: uint, chunks: uint ]
