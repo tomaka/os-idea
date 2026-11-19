@@ -1,60 +1,20 @@
-#![no_std]
-#![no_main]
-
-extern crate alloc;
-
-use core::{ffi, mem::MaybeUninit};
-
 mod vm;
 
-#[global_allocator]
-static ALLOCATOR: talc::cell::TalcSyncCell<
-    talc::source::Claim,
-    talc::base::binning::DefaultBinning,
-> = unsafe {
-    static mut HEAP: [MaybeUninit<u8>; 16 * 1024 * 1024] =
-        [MaybeUninit::uninit(); 16 * 1024 * 1024];
-    // SAFETY: the init process is single-threaded.
-    talc::cell::TalcSyncCell::new(talc::TalcCell::new(talc::source::Claim::array(
-        &raw mut HEAP,
-    )))
-};
-
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    // TODO: do something
-    loop {}
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn _start(_argc: ffi::c_int, _argv: *const *const ffi::c_char) -> ffi::c_int {
-    stdout("Hello world\n");
+fn main() {
+    println!("Hello world");
 
     match run_wasm(TEST_WASM) {
-        Ok(results) => stdout(&alloc::format!("Wasm returned {results:?}\n")),
-        Err(err) => stdout(&alloc::format!("Wasm error: {err}\n")),
+        Ok(results) => println!("Wasm returned {results:?}"),
+        Err(err) => println!("Wasm error: {err}"),
     }
 
-    // Pause forever.
+    // As PID 1, exiting would make the kernel panic. Pause forever instead.
     loop {
-        unsafe {
-            let _ = syscalls::syscall!(syscalls::Sysno::pause);
-        }
+        std::thread::park();
     }
 }
 
-fn stdout(msg: &str) {
-    unsafe {
-        let _ = syscalls::syscall!(
-            syscalls::Sysno::write,
-            1, // stdout
-            msg.as_ptr(),
-            msg.len()
-        );
-    }
-}
-
-fn run_wasm(wasm_bytes: &[u8]) -> Result<alloc::vec::Vec<vm::Value>, vm::Error> {
+fn run_wasm(wasm_bytes: &[u8]) -> Result<Vec<vm::Value>, vm::Error> {
     let module = vm::Module::new(wasm_bytes)?;
     let mut instance = vm::Instance::new(&module)?;
     instance.call("main", &[])

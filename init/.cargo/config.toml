@@ -1,6 +1,5 @@
-[target.x86_64-unknown-none]
-# By default this target produces a static-PIE, but nothing applies its relocations at startup
-# (there is no dynamic loader and no self-relocation code), which breaks vtables and any other
-# pointer stored in static data. Link a non-relocatable executable instead.
-rustflags = ["-C", "relocation-model=static"]
-# TODO: do this in xtask?
+[target.x86_64-unknown-linux-musl]
+# Use Rust's bundled linker, so that cross-compiling from a non-Linux host doesn't need a Linux
+# C toolchain, and link against the C runtime and `libc.a` shipped with the Rust target.
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]

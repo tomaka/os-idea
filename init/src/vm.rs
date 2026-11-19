@@ -16,8 +16,7 @@
 //! `ud2` instructions and thus currently raise a `SIGILL` that kills the process. They should
 //! instead be caught and reported as errors.
 
-use alloc::{boxed::Box, collections::BTreeMap, string::String, vec, vec::Vec};
-use core::{fmt, mem::offset_of, ptr};
+use std::{collections::BTreeMap, fmt, mem::offset_of, ptr};
 
 use cranelift_codegen::{
     Context, FinalizedRelocTarget,
@@ -552,7 +551,7 @@ impl<'m> Instance<'m> {
 
         unsafe {
             let trampoline: extern "sysv64" fn(*mut VmCtx, *mut u64) =
-                core::mem::transmute(self.module.code.ptr.add(offset));
+                std::mem::transmute(self.module.code.ptr.add(offset));
             trampoline(&mut *self.vmctx, values.as_mut_ptr());
         }
 

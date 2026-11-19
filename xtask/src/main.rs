@@ -18,7 +18,7 @@ fn main() {
         .args([
             "build",
             "--target",
-            "x86_64-unknown-none",
+            "x86_64-unknown-linux-musl",
             "--package",
             "init",
         ])
@@ -33,7 +33,7 @@ fn main() {
         project_root
             .join("init")
             .join("target")
-            .join("x86_64-unknown-none")
+            .join("x86_64-unknown-linux-musl")
             .join("debug")
             .join("init"),
         "image.img",
