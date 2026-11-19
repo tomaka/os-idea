@@ -1,0 +1,9 @@
+[package]
+name = "test"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+dlmalloc = { version = "0.2.14", features = ["global"] }
+interface-bindings = { path = "../../interface-bindings" }
