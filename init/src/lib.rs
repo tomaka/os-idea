@@ -1,6 +1,7 @@
 mod vm;
 
-fn main() {
+/// Entry point of the init program. Runs the tests and then pauses forever.
+pub fn run() -> ! {
     println!("Hello world");
 
     // SAFETY: nothing else in this program installs signal handlers.

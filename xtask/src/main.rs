@@ -1,6 +1,6 @@
 use std::path::Path;
-use std::process;
 
+mod build_init;
 mod build_kernel;
 mod disk_image;
 
@@ -13,30 +13,7 @@ fn main() {
 
     let bzimage = build_kernel::build_kernel(&project_root).unwrap();
 
-    let status = process::Command::new(env!("CARGO"))
-        .current_dir(project_root.join("init"))
-        .args([
-            "build",
-            "--target",
-            "x86_64-unknown-linux-musl",
-            "--package",
-            "init",
-        ])
-        .status()
-        .unwrap();
-    if !status.success() {
-        panic!("cargo build failed");
-    }
+    let init = build_init::build_init();
 
-    disk_image::build_disk_image(
-        bzimage,
-        project_root
-            .join("init")
-            .join("target")
-            .join("x86_64-unknown-linux-musl")
-            .join("debug")
-            .join("init"),
-        "image.img",
-    )
-    .unwrap();
+    disk_image::build_disk_image(bzimage, init, "image.img").unwrap();
 }
