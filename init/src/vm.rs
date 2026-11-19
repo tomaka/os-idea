@@ -713,16 +713,6 @@ impl<'a> Translator<'a> {
         })
     }
 
-    fn pop(&mut self) -> ir::Value {
-        self.stack.pop().unwrap()
-    }
-
-    fn pop2(&mut self) -> (ir::Value, ir::Value) {
-        let b = self.pop();
-        let a = self.pop();
-        (a, b)
-    }
-
     fn top_n(&self, n: usize) -> Vec<BlockArg> {
         self.stack[self.stack.len() - n..]
             .iter()
@@ -744,32 +734,6 @@ impl<'a> Translator<'a> {
         }
     }
 
-    fn binop(&mut self, f: impl FnOnce(&mut FunctionBuilder, ir::Value, ir::Value) -> ir::Value) {
-        let (a, b) = self.pop2();
-        let v = f(&mut self.builder, a, b);
-        self.stack.push(v);
-    }
-
-    fn unop(&mut self, f: impl FnOnce(&mut FunctionBuilder, ir::Value) -> ir::Value) {
-        let a = self.pop();
-        let v = f(&mut self.builder, a);
-        self.stack.push(v);
-    }
-
-    fn cmp(&mut self, cc: IntCC) {
-        let (a, b) = self.pop2();
-        let c = self.builder.ins().icmp(cc, a, b);
-        let v = self.builder.ins().uextend(types::I32, c);
-        self.stack.push(v);
-    }
-
-    fn eqz(&mut self) {
-        let a = self.pop();
-        let c = self.builder.ins().icmp_imm_u(IntCC::Equal, a, 0);
-        let v = self.builder.ins().uextend(types::I32, c);
-        self.stack.push(v);
-    }
-
     fn vmctx_load(&mut self, offset: usize) -> ir::Value {
         self.builder
             .ins()
@@ -778,7 +742,7 @@ impl<'a> Translator<'a> {
 
     /// Pops a Wasm address, bounds-checks it, and returns the native address to access.
     fn mem_addr(&mut self, memarg: &wasmparser::MemArg, access_size: u64) -> ir::Value {
-        let addr = self.pop();
+        let addr = self.stack.pop().unwrap_or_else(|| unreachable!());
         let addr = self.builder.ins().uextend(types::I64, addr);
         let mem_len = self.vmctx_load(offset_of!(VmCtx, mem_len));
         // Can't overflow, as `addr` and `memarg.offset` both fit in 32 bits.
@@ -813,7 +777,7 @@ impl<'a> Translator<'a> {
         size: u64,
         f: impl FnOnce(&mut FunctionBuilder, MemFlagsData, ir::Value, ir::Value),
     ) {
-        let val = self.pop();
+        let val = self.stack.pop().unwrap_or_else(|| unreachable!());
         let ptr = self.mem_addr(memarg, size);
         f(&mut self.builder, MemFlagsData::new(), val, ptr);
     }
@@ -881,7 +845,7 @@ impl<'a> Translator<'a> {
                 });
             }
             Operator::If { blockty } => {
-                let cond = self.pop();
+                let cond = self.stack.pop().unwrap_or_else(|| unreachable!());
                 let (params, results) = self.block_type(blockty)?;
                 let then_block = self.builder.create_block();
                 let else_block = self.builder.create_block();
@@ -968,7 +932,7 @@ impl<'a> Translator<'a> {
                 self.reachable = false;
             }
             Operator::BrIf { relative_depth } => {
-                let cond = self.pop();
+                let cond = self.stack.pop().unwrap_or_else(|| unreachable!());
                 let (target, n) = self.branch_target(relative_depth);
                 let args = self.top_n(n);
                 let next = self.builder.create_block();
@@ -976,7 +940,7 @@ impl<'a> Translator<'a> {
                 self.builder.switch_to_block(next);
             }
             Operator::BrTable { targets } => {
-                let index = self.pop();
+                let index = self.stack.pop().unwrap_or_else(|| unreachable!());
                 let mut depths = Vec::new();
                 for t in targets.targets() {
                     depths.push(t?);
@@ -1024,11 +988,12 @@ impl<'a> Translator<'a> {
             }
 
             Operator::Drop => {
-                self.pop();
+                self.stack.pop().unwrap_or_else(|| unreachable!());
             }
             Operator::Select | Operator::TypedSelect { .. } => {
-                let cond = self.pop();
-                let (a, b) = self.pop2();
+                let cond = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
                 let v = self.builder.ins().select(cond, a, b);
                 self.stack.push(v);
             }
@@ -1038,7 +1003,7 @@ impl<'a> Translator<'a> {
                 self.stack.push(v);
             }
             Operator::LocalSet { local_index } => {
-                let v = self.pop();
+                let v = self.stack.pop().unwrap_or_else(|| unreachable!());
                 self.builder.def_var(self.locals[local_index as usize], v);
             }
             Operator::LocalTee { local_index } => {
@@ -1060,7 +1025,7 @@ impl<'a> Translator<'a> {
                 self.stack.push(v);
             }
             Operator::GlobalSet { global_index } => {
-                let v = self.pop();
+                let v = self.stack.pop().unwrap_or_else(|| unreachable!());
                 let globals = self.vmctx_load(offset_of!(VmCtx, globals));
                 self.builder.ins().store(
                     MemFlagsData::trusted(),
@@ -1133,7 +1098,7 @@ impl<'a> Translator<'a> {
             }
             Operator::MemoryGrow { .. } => {
                 // TODO: growing memory isn't supported; always report a failure
-                self.pop();
+                self.stack.pop().unwrap_or_else(|| unreachable!());
                 let v = self.builder.ins().iconst(i32t, -1);
                 self.stack.push(v);
             }
@@ -1147,63 +1112,237 @@ impl<'a> Translator<'a> {
                 self.stack.push(v);
             }
 
-            Operator::I32Eqz | Operator::I64Eqz => self.eqz(),
-            Operator::I32Eq | Operator::I64Eq => self.cmp(IntCC::Equal),
-            Operator::I32Ne | Operator::I64Ne => self.cmp(IntCC::NotEqual),
-            Operator::I32LtS | Operator::I64LtS => self.cmp(IntCC::SignedLessThan),
-            Operator::I32LtU | Operator::I64LtU => self.cmp(IntCC::UnsignedLessThan),
-            Operator::I32GtS | Operator::I64GtS => self.cmp(IntCC::SignedGreaterThan),
-            Operator::I32GtU | Operator::I64GtU => self.cmp(IntCC::UnsignedGreaterThan),
-            Operator::I32LeS | Operator::I64LeS => self.cmp(IntCC::SignedLessThanOrEqual),
-            Operator::I32LeU | Operator::I64LeU => self.cmp(IntCC::UnsignedLessThanOrEqual),
-            Operator::I32GeS | Operator::I64GeS => self.cmp(IntCC::SignedGreaterThanOrEqual),
-            Operator::I32GeU | Operator::I64GeU => self.cmp(IntCC::UnsignedGreaterThanOrEqual),
+            Operator::I32Eqz | Operator::I64Eqz => {
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let c = self.builder.ins().icmp_imm_u(IntCC::Equal, a, 0);
+                let v = self.builder.ins().uextend(types::I32, c);
+                self.stack.push(v);
+            }
+            Operator::I32Eq | Operator::I64Eq => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let c = self.builder.ins().icmp(IntCC::Equal, a, b);
+                let v = self.builder.ins().uextend(types::I32, c);
+                self.stack.push(v);
+            }
+            Operator::I32Ne | Operator::I64Ne => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let c = self.builder.ins().icmp(IntCC::NotEqual, a, b);
+                let v = self.builder.ins().uextend(types::I32, c);
+                self.stack.push(v);
+            }
+            Operator::I32LtS | Operator::I64LtS => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let c = self.builder.ins().icmp(IntCC::SignedLessThan, a, b);
+                let v = self.builder.ins().uextend(types::I32, c);
+                self.stack.push(v);
+            }
+            Operator::I32LtU | Operator::I64LtU => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let c = self.builder.ins().icmp(IntCC::UnsignedLessThan, a, b);
+                let v = self.builder.ins().uextend(types::I32, c);
+                self.stack.push(v);
+            }
+            Operator::I32GtS | Operator::I64GtS => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let c = self.builder.ins().icmp(IntCC::SignedGreaterThan, a, b);
+                let v = self.builder.ins().uextend(types::I32, c);
+                self.stack.push(v);
+            }
+            Operator::I32GtU | Operator::I64GtU => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let c = self.builder.ins().icmp(IntCC::UnsignedGreaterThan, a, b);
+                let v = self.builder.ins().uextend(types::I32, c);
+                self.stack.push(v);
+            }
+            Operator::I32LeS | Operator::I64LeS => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let c = self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, a, b);
+                let v = self.builder.ins().uextend(types::I32, c);
+                self.stack.push(v);
+            }
+            Operator::I32LeU | Operator::I64LeU => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let c = self.builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, a, b);
+                let v = self.builder.ins().uextend(types::I32, c);
+                self.stack.push(v);
+            }
+            Operator::I32GeS | Operator::I64GeS => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let c = self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, a, b);
+                let v = self.builder.ins().uextend(types::I32, c);
+                self.stack.push(v);
+            }
+            Operator::I32GeU | Operator::I64GeU => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let c = self.builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, a, b);
+                let v = self.builder.ins().uextend(types::I32, c);
+                self.stack.push(v);
+            }
 
-            Operator::I32Clz | Operator::I64Clz => self.unop(|b, a| b.ins().clz(a)),
-            Operator::I32Ctz | Operator::I64Ctz => self.unop(|b, a| b.ins().ctz(a)),
-            Operator::I32Popcnt | Operator::I64Popcnt => self.unop(|b, a| b.ins().popcnt(a)),
-            Operator::I32Add | Operator::I64Add => self.binop(|b, x, y| b.ins().iadd(x, y)),
-            Operator::I32Sub | Operator::I64Sub => self.binop(|b, x, y| b.ins().isub(x, y)),
-            Operator::I32Mul | Operator::I64Mul => self.binop(|b, x, y| b.ins().imul(x, y)),
+            Operator::I32Clz | Operator::I64Clz => {
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let v = self.builder.ins().clz(a);
+                self.stack.push(v);
+            }
+            Operator::I32Ctz | Operator::I64Ctz => {
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let v = self.builder.ins().ctz(a);
+                self.stack.push(v);
+            }
+            Operator::I32Popcnt | Operator::I64Popcnt => {
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let v = self.builder.ins().popcnt(a);
+                self.stack.push(v);
+            }
+            Operator::I32Add | Operator::I64Add => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let v = self.builder.ins().iadd(a, b);
+                self.stack.push(v);
+            }
+            Operator::I32Sub | Operator::I64Sub => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let v = self.builder.ins().isub(a, b);
+                self.stack.push(v);
+            }
+            Operator::I32Mul | Operator::I64Mul => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let v = self.builder.ins().imul(a, b);
+                self.stack.push(v);
+            }
             // Cranelift's division and remainder trap on division by zero and on overflow,
             // and `srem(INT_MIN, -1)` returns 0, which matches Wasm semantics.
-            Operator::I32DivS | Operator::I64DivS => self.binop(|b, x, y| b.ins().sdiv(x, y)),
-            Operator::I32DivU | Operator::I64DivU => self.binop(|b, x, y| b.ins().udiv(x, y)),
-            Operator::I32RemS | Operator::I64RemS => self.binop(|b, x, y| b.ins().srem(x, y)),
-            Operator::I32RemU | Operator::I64RemU => self.binop(|b, x, y| b.ins().urem(x, y)),
-            Operator::I32And | Operator::I64And => self.binop(|b, x, y| b.ins().band(x, y)),
-            Operator::I32Or | Operator::I64Or => self.binop(|b, x, y| b.ins().bor(x, y)),
-            Operator::I32Xor | Operator::I64Xor => self.binop(|b, x, y| b.ins().bxor(x, y)),
+            Operator::I32DivS | Operator::I64DivS => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let v = self.builder.ins().sdiv(a, b);
+                self.stack.push(v);
+            }
+            Operator::I32DivU | Operator::I64DivU => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let v = self.builder.ins().udiv(a, b);
+                self.stack.push(v);
+            }
+            Operator::I32RemS | Operator::I64RemS => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let v = self.builder.ins().srem(a, b);
+                self.stack.push(v);
+            }
+            Operator::I32RemU | Operator::I64RemU => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let v = self.builder.ins().urem(a, b);
+                self.stack.push(v);
+            }
+            Operator::I32And | Operator::I64And => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let v = self.builder.ins().band(a, b);
+                self.stack.push(v);
+            }
+            Operator::I32Or | Operator::I64Or => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let v = self.builder.ins().bor(a, b);
+                self.stack.push(v);
+            }
+            Operator::I32Xor | Operator::I64Xor => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let v = self.builder.ins().bxor(a, b);
+                self.stack.push(v);
+            }
             // Cranelift masks the shift amount, like Wasm does.
-            Operator::I32Shl | Operator::I64Shl => self.binop(|b, x, y| b.ins().ishl(x, y)),
-            Operator::I32ShrS | Operator::I64ShrS => self.binop(|b, x, y| b.ins().sshr(x, y)),
-            Operator::I32ShrU | Operator::I64ShrU => self.binop(|b, x, y| b.ins().ushr(x, y)),
-            Operator::I32Rotl | Operator::I64Rotl => self.binop(|b, x, y| b.ins().rotl(x, y)),
-            Operator::I32Rotr | Operator::I64Rotr => self.binop(|b, x, y| b.ins().rotr(x, y)),
+            Operator::I32Shl | Operator::I64Shl => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let v = self.builder.ins().ishl(a, b);
+                self.stack.push(v);
+            }
+            Operator::I32ShrS | Operator::I64ShrS => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let v = self.builder.ins().sshr(a, b);
+                self.stack.push(v);
+            }
+            Operator::I32ShrU | Operator::I64ShrU => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let v = self.builder.ins().ushr(a, b);
+                self.stack.push(v);
+            }
+            Operator::I32Rotl | Operator::I64Rotl => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let v = self.builder.ins().rotl(a, b);
+                self.stack.push(v);
+            }
+            Operator::I32Rotr | Operator::I64Rotr => {
+                let b = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let v = self.builder.ins().rotr(a, b);
+                self.stack.push(v);
+            }
 
-            Operator::I32WrapI64 => self.unop(|b, a| b.ins().ireduce(i32t, a)),
-            Operator::I64ExtendI32S => self.unop(|b, a| b.ins().sextend(i64t, a)),
-            Operator::I64ExtendI32U => self.unop(|b, a| b.ins().uextend(i64t, a)),
-            Operator::I32Extend8S => self.unop(|b, a| {
-                let a = b.ins().ireduce(types::I8, a);
-                b.ins().sextend(i32t, a)
-            }),
-            Operator::I32Extend16S => self.unop(|b, a| {
-                let a = b.ins().ireduce(types::I16, a);
-                b.ins().sextend(i32t, a)
-            }),
-            Operator::I64Extend8S => self.unop(|b, a| {
-                let a = b.ins().ireduce(types::I8, a);
-                b.ins().sextend(i64t, a)
-            }),
-            Operator::I64Extend16S => self.unop(|b, a| {
-                let a = b.ins().ireduce(types::I16, a);
-                b.ins().sextend(i64t, a)
-            }),
-            Operator::I64Extend32S => self.unop(|b, a| {
-                let a = b.ins().ireduce(i32t, a);
-                b.ins().sextend(i64t, a)
-            }),
+            Operator::I32WrapI64 => {
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let v = self.builder.ins().ireduce(i32t, a);
+                self.stack.push(v);
+            }
+            Operator::I64ExtendI32S => {
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let v = self.builder.ins().sextend(i64t, a);
+                self.stack.push(v);
+            }
+            Operator::I64ExtendI32U => {
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let v = self.builder.ins().uextend(i64t, a);
+                self.stack.push(v);
+            }
+            Operator::I32Extend8S => {
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.builder.ins().ireduce(types::I8, a);
+                let v = self.builder.ins().sextend(i32t, a);
+                self.stack.push(v);
+            }
+            Operator::I32Extend16S => {
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.builder.ins().ireduce(types::I16, a);
+                let v = self.builder.ins().sextend(i32t, a);
+                self.stack.push(v);
+            }
+            Operator::I64Extend8S => {
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.builder.ins().ireduce(types::I8, a);
+                let v = self.builder.ins().sextend(i64t, a);
+                self.stack.push(v);
+            }
+            Operator::I64Extend16S => {
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.builder.ins().ireduce(types::I16, a);
+                let v = self.builder.ins().sextend(i64t, a);
+                self.stack.push(v);
+            }
+            Operator::I64Extend32S => {
+                let a = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let a = self.builder.ins().ireduce(i32t, a);
+                let v = self.builder.ins().sextend(i64t, a);
+                self.stack.push(v);
+            }
 
             _ => return Err(Error::Unsupported("operator")),
         }
