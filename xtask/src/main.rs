@@ -11,8 +11,7 @@ fn main() {
         .unwrap()
         .to_path_buf();
 
-    // TODO: commented out to speed up build ; restore and properly do mtimes comparison
-    //build_kernel::build_kernel(&project_root).unwrap();
+    let bzimage = build_kernel::build_kernel(&project_root).unwrap();
 
     let status = process::Command::new(env!("CARGO"))
         .current_dir(project_root.join("init"))
@@ -30,7 +29,7 @@ fn main() {
     }
 
     disk_image::build_disk_image(
-        project_root.join("bzImage"),
+        bzimage,
         project_root
             .join("init")
             .join("target")

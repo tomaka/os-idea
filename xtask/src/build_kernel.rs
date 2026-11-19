@@ -1,4 +1,8 @@
-use std::{fs, io, path::Path};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 
 /// Compiles the Linux kernel using Docker.
 ///
@@ -10,10 +14,34 @@ use std::{fs, io, path::Path};
 /// as individual files in a cache directory, this is just not possible.
 /// Instead, we just a `tar` of the kernel in the repository and untar it before building. When
 /// it comes to build artifacts, we  `tar` and `untar` them at every build.
-pub fn build_kernel(project_root: impl AsRef<Path>) -> Result<(), io::Error> {
+///
+/// The build artifacts and the resulting `bzImage` are stored in `target/kernel`. Similar to
+/// `make`, the build is skipped entirely if the `bzImage` is more recent than all the inputs
+/// (the kernel source archive, the Dockerfile, and this source file which contains the kernel
+/// configuration).
+///
+/// Returns the path to the `bzImage`.
+pub fn build_kernel(project_root: impl AsRef<Path>) -> Result<PathBuf, io::Error> {
+    let project_root = project_root.as_ref();
+    let out_dir = project_root.join("target").join("kernel");
+    let kernel_tar = project_root.join("linux-7.0.tar.gz");
+    let artifacts = out_dir.join("build-artifacts.tar.gz");
+    let bzimage = out_dir.join("bzImage");
+
+    let inputs = [
+        kernel_tar.clone(),
+        project_root.join("xtask").join("kernel-builder-Dockerfile"),
+        project_root.join("xtask").join("src").join("build_kernel.rs"),
+    ];
+    if is_up_to_date(&bzimage, &inputs)? {
+        return Ok(bzimage);
+    }
+
+    fs::create_dir_all(&out_dir)?;
+
     tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(async move {
+        .block_on(async {
             let docker = bollard::Docker::connect_with_local_defaults()
                 .expect("Failed to connect to Docker daemon");
 
@@ -21,19 +49,39 @@ pub fn build_kernel(project_root: impl AsRef<Path>) -> Result<(), io::Error> {
             build_image(&docker, "kernel-builder:latest".to_string()).await?;
             actually_build_kernel(
                 &docker,
-                project_root.as_ref().join("linux-7.0.tar.gz"),
-                project_root.as_ref().join("build-artifacts.tar.gz"),
+                &kernel_tar,
+                &artifacts,
                 "kernel-builder:latest".to_string(),
             )
-            .await?;
-            extract_specific_file(
-                project_root.as_ref().join("build-artifacts.tar.gz"),
-                "arch/x86/boot/bzImage",
-                project_root.as_ref().join("bzImage"),
-            )?;
+            .await
+        })?;
 
-            Ok(())
-        })
+    // The `bzImage` acts as the stamp file and is thus written last, atomically, so that an
+    // interrupted build never leaves an up-to-date-looking `bzImage`.
+    let tmp = out_dir.join("bzImage.tmp");
+    extract_specific_file(&artifacts, "arch/x86/boot/bzImage", &tmp)?;
+    fs::rename(&tmp, &bzimage)?;
+
+    Ok(bzimage)
+}
+
+/// Returns `true` if `output` exists and is at least as recent as all of the `inputs`.
+fn is_up_to_date(output: &Path, inputs: &[PathBuf]) -> Result<bool, io::Error> {
+    let output_mtime = match fs::metadata(output) {
+        Ok(m) => m.modified()?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+
+    let mut newest_input = SystemTime::UNIX_EPOCH;
+    for input in inputs {
+        let mtime = fs::metadata(input)
+            .and_then(|m| m.modified())
+            .map_err(|err| io::Error::new(err.kind(), format!("{}: {err}", input.display())))?;
+        newest_input = newest_input.max(mtime);
+    }
+
+    Ok(output_mtime >= newest_input)
 }
 
 /// Builds the Docker image used to build the Linux kernel, and gives it the given image tag.
@@ -217,6 +265,8 @@ fn extract_specific_file(
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(io::BufReader::new(
         fs::File::open(archive_path)?,
     )));
+    // Give the extracted file the current time, as it is used for mtime comparisons.
+    archive.set_preserve_mtime(false);
 
     for entry in archive.entries()? {
         let mut entry = entry?;
