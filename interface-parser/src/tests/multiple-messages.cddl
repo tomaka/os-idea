@@ -1,0 +1,17 @@
+message =
+    [ read-request, read-response ] /
+    write-notification /
+    [ request: close-request, response: close-response ] /
+    [ uint, uint, uint ]
+
+read-request = { handle: uint, length: uint }
+read-response = bytes
+write-notification = [ handle: uint, data: bytes ]
+close-request = uint
+close-response = nil
+
+message /= [ ping-request, ping-response ] / shutdown-notification
+
+ping-request = []
+ping-response = []
+shutdown-notification = nil

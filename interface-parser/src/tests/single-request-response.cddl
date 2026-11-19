@@ -1,0 +1,15 @@
+; Interface with a single request-response.
+message = [ spawn-request, spawn-response ]
+
+spawn-request = [
+    bytes .size 32,     ; Hash of the program
+    links,
+]
+
+spawn-response = [
+    bytes .size 32      ; Public key of the spawned program
+]
+
+links = {
+    * bytes .size 32 => bytes .size 32
+}

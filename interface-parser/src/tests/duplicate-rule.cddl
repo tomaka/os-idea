@@ -1,0 +1,3 @@
+message = foo
+foo = uint
+foo = tstr
