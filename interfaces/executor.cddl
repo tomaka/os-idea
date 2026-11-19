@@ -1,0 +1,16 @@
+message =
+    [ start-request, start-response ]
+
+start-request = [
+    bytes .size 32,     ; BLAKE3 hash
+    interfaces
+]
+
+start-response = [
+    bytes .size 32     ; Public key of the spawned program
+]
+
+interfaces = {
+    ; For each interface hash, the public key of the program that handles it
+    * bytes .size 32 => bytes .size 32
+}

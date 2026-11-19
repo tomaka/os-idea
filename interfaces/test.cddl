@@ -1,0 +1,10 @@
+; TODO: test interface, remove
+message =
+    [ hello-request, hello-response ]
+
+hello-request = [
+    tstr        ; Message
+]
+
+hello-response = {
+}
