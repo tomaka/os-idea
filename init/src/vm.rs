@@ -6,17 +6,32 @@
 //!
 //! Supported subset:
 //!
-//! - No imports, no tables, no start function.
+//! - Function imports only. No tables, no start function.
 //! - Only `i32` and `i64` value types (no floats, no SIMD, no references).
 //! - Control flow (`block`, `loop`, `if`/`else`, `br`, `br_if`, `br_table`, `return`,
 //!   `unreachable`), direct calls, locals, globals, all integer arithmetic.
 //! - At most one linear memory, with explicit bounds checks. `memory.grow` always fails.
 //!
-//! TODO: traps (out-of-bounds access, division by zero, `unreachable`, ...) are compiled into
-//! `ud2` instructions and thus currently raise a `SIGILL` that kills the process. They should
-//! instead be caught and reported as errors.
+//! # Execution model
+//!
+//! Every [`Instance`] owns a native stack, separate from the stack of the host, on which the
+//! Wasm code runs. Switching between the host stack and the Wasm stack is done by a small
+//! assembly routine (`init_vm_switch`) that saves the callee-saved registers and the stack
+//! pointer of one side and restores the ones of the other side.
+//!
+//! Execution of the Wasm code switches back to the host stack when:
+//!
+//! - The called function returns.
+//! - The Wasm code calls an imported function. The host gets an [`Outcome::ImportCall`] and
+//!   can later continue the execution with [`Instance::resume`].
+//! - The Wasm code traps. Cranelift compiles traps into `ud2` instructions or relies on the
+//!   CPU raising an exception, and stack overflows hit a guard page. The resulting `SIGILL`,
+//!   `SIGFPE` or `SIGSEGV` is caught by a signal handler (see [`install_trap_handlers`]) that
+//!   redirects the execution to a routine that abandons the Wasm stack and jumps back to the
+//!   host stack.
 
-use std::{collections::BTreeMap, fmt, mem::offset_of, ptr};
+use core::{arch::global_asm, cell::Cell, fmt, mem::offset_of, ptr};
+use std::collections::BTreeMap;
 
 use cranelift_codegen::{
     Context, FinalizedRelocTarget,
@@ -40,6 +55,120 @@ const WASM_PAGE_SIZE: u64 = 65536;
 const NAMESPACE_WASM_FUNC: u32 = 0;
 /// Namespace of the [`UserExternalName`]s that designate trampolines.
 const NAMESPACE_TRAMPOLINE: u32 = 1;
+/// Namespace of the [`UserExternalName`]s that designate routines of the host. The only
+/// routine is `init_vm_yield`, at index 0.
+const NAMESPACE_HOST: u32 = 2;
+
+/// Size in bytes of the usable part of the native stack of each instance.
+const STACK_SIZE: usize = 1024 * 1024;
+/// Size in bytes of the inaccessible region below the native stack of each instance.
+const STACK_GUARD_SIZE: usize = 64 * 1024;
+
+/// Value returned by `init_vm_switch` on the host side when the Wasm function has returned.
+const OUTCOME_FINISHED: u64 = 0;
+/// Value returned by `init_vm_switch` on the host side when the Wasm code calls an import.
+const OUTCOME_IMPORT: u64 = 1;
+/// Value returned by `init_vm_switch` on the host side when the Wasm code has trapped.
+const OUTCOME_TRAP: u64 = 2;
+
+global_asm!(
+    // `init_vm_switch(save_rsp: *mut u64, new_rsp: u64, value: u64) -> u64`
+    //
+    // Pushes the callee-saved registers on the current stack, writes the stack pointer to
+    // `save_rsp`, then switches to the stack `new_rsp`, pops the callee-saved registers from
+    // it and returns `value` to whoever had pushed them.
+    ".text",
+    ".p2align 4",
+    ".globl init_vm_switch",
+    "init_vm_switch:",
+    "push rbp",
+    "push rbx",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "mov [rdi], rsp",
+    "mov rsp, rsi",
+    "mov rax, rdx",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop rbx",
+    "pop rbp",
+    "ret",
+    // `init_vm_fiber_start`
+    //
+    // Reached through the `ret` of `init_vm_switch` when switching to a fresh stack prepared
+    // by `Instance::call`, with `r12` = `vmctx`, `r13` = values buffer, `r14` = trampoline.
+    ".p2align 4",
+    ".globl init_vm_fiber_start",
+    "init_vm_fiber_start:",
+    "mov rdi, r12",
+    "mov rsi, r13",
+    "call r14",
+    "lea rdi, [r12 + {wasm_rsp}]",
+    "mov rsi, [r12 + {host_rsp}]",
+    "mov edx, {finished}",
+    "call init_vm_switch",
+    "ud2",
+    // `init_vm_yield(vmctx: *mut VmCtx)`
+    //
+    // Called by the Wasm code in order to call an import. Switches back to the host, and
+    // returns when the host resumes the execution.
+    ".p2align 4",
+    ".globl init_vm_yield",
+    "init_vm_yield:",
+    "mov rsi, [rdi + {host_rsp}]",
+    "lea rdi, [rdi + {wasm_rsp}]",
+    "mov edx, {import}",
+    "jmp init_vm_switch",
+    // `init_vm_trap_landing(vmctx: *mut VmCtx)`
+    //
+    // Jumped to by the signal handler when the Wasm code traps. Abandons the Wasm stack and
+    // returns to the host.
+    ".p2align 4",
+    ".globl init_vm_trap_landing",
+    "init_vm_trap_landing:",
+    "mov rsp, [rdi + {host_rsp}]",
+    "mov eax, {trap}",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop rbx",
+    "pop rbp",
+    "ret",
+    // `init_vm_sigreturn`
+    //
+    // Restorer of the signal handlers, as required by `rt_sigaction`.
+    ".p2align 4",
+    ".globl init_vm_sigreturn",
+    "init_vm_sigreturn:",
+    "mov eax, 15", // `rt_sigreturn`
+    "syscall",
+    "ud2",
+    wasm_rsp = const offset_of!(VmCtx, wasm_rsp),
+    host_rsp = const offset_of!(VmCtx, host_rsp),
+    finished = const OUTCOME_FINISHED,
+    import = const OUTCOME_IMPORT,
+    trap = const OUTCOME_TRAP,
+);
+
+unsafe extern "sysv64" {
+    fn init_vm_switch(save_rsp: *mut u64, new_rsp: u64, value: u64) -> u64;
+    fn init_vm_fiber_start();
+    fn init_vm_yield(vmctx: *mut VmCtx);
+    fn init_vm_trap_landing(vmctx: *mut VmCtx);
+    fn init_vm_sigreturn();
+}
+
+thread_local! {
+    /// Context of the instance currently executing Wasm code on this thread, or null if none.
+    ///
+    /// Read by the signal handler in order to determine whether a fault comes from Wasm code.
+    static CURRENT_VMCTX: Cell<*mut VmCtx> = const { Cell::new(ptr::null_mut()) };
+}
 
 /// A Wasm value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,8 +190,44 @@ pub enum Error {
     Mmap,
     /// The requested export doesn't exist or isn't a function.
     NoSuchExport,
-    /// The parameters passed to [`Instance::call`] don't match the function signature.
+    /// The parameters passed to [`Instance::call`] or [`Instance::resume`] don't match the
+    /// function signature.
     BadArgs,
+    /// [`Instance::resume`] was called while no execution is suspended.
+    NotSuspended,
+    /// Failed to install the signal handlers.
+    SignalHandlers,
+    /// The Wasm code has trapped.
+    Trap(Trap),
+}
+
+/// Reason why the execution of Wasm code has trapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trap {
+    /// An `unreachable` instruction was executed.
+    Unreachable,
+    /// The memory was accessed out of its bounds.
+    OutOfBounds,
+    /// An integer division or remainder by zero.
+    DivisionByZero,
+    /// The result of a signed integer division doesn't fit in its type.
+    IntegerOverflow,
+    /// The native stack of the instance is exhausted.
+    StackOverflow,
+    /// The Wasm code has faulted for an unknown reason. Indicates a bug in the VM.
+    Unknown,
+}
+
+/// What happened to the execution of Wasm code after [`Instance::call`] or
+/// [`Instance::resume`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// The called function has returned these values.
+    Return(Vec<Value>),
+    /// The Wasm code is calling the imported function whose index is `import` (see
+    /// [`Module::imports_by_index`]) with the given arguments. Call [`Instance::resume`] with
+    /// the return values in order to continue the execution.
+    ImportCall { import: u32, args: Vec<Value> },
 }
 
 impl From<wasmparser::BinaryReaderError> for Error {
@@ -80,6 +245,9 @@ impl fmt::Display for Error {
             Error::Mmap => write!(f, "failed to allocate executable memory"),
             Error::NoSuchExport => write!(f, "no such exported function"),
             Error::BadArgs => write!(f, "arguments don't match the function signature"),
+            Error::NotSuspended => write!(f, "no execution is suspended"),
+            Error::SignalHandlers => write!(f, "failed to install the signal handlers"),
+            Error::Trap(trap) => write!(f, "Wasm trap: {trap:?}"),
         }
     }
 }
@@ -90,6 +258,26 @@ struct VmCtx {
     mem_base: *mut u8,
     mem_len: u64,
     globals: *mut u64,
+    /// Buffer used to pass parameters and results between the host and the Wasm code.
+    values: *mut u64,
+    /// Index of the import being called, written by the Wasm code before yielding.
+    import_idx: u32,
+    /// Signal number of the latest trap, written by the signal handler.
+    trap_signal: u32,
+    /// Instruction pointer of the latest trap, written by the signal handler.
+    trap_pc: u64,
+    /// Faulting address of the latest trap, written by the signal handler.
+    trap_addr: u64,
+    /// Stack pointer of the host, saved while the Wasm code runs.
+    host_rsp: u64,
+    /// Stack pointer of the Wasm code, saved while the host runs.
+    wasm_rsp: u64,
+    /// Range of addresses of the compiled code of the module.
+    code_start: u64,
+    code_end: u64,
+    /// Range of addresses of the guard region of the Wasm stack.
+    guard_start: u64,
+    guard_end: u64,
 }
 
 /// Signature of a Wasm function, restricted to the supported types.
@@ -141,9 +329,11 @@ fn eval_const_expr(expr: &wasmparser::ConstExpr) -> Result<Value, Error> {
 
 /// A compiled Wasm module.
 pub struct Module {
-    code: ExecMemory,
-    /// Signature of each function.
+    code: Mmap,
+    /// Signature of each function, imported functions first.
     funcs: Vec<FuncSig>,
+    /// Imported functions: (module name, field name).
+    imports: Vec<(String, String)>,
     /// Exported functions: name => (function index, offset of the trampoline in `code`).
     exports: BTreeMap<String, (u32, usize)>,
     /// Minimum number of pages of the memory, if any.
@@ -151,6 +341,10 @@ pub struct Module {
     globals: Vec<Value>,
     /// Active data segments: (offset in memory, bytes).
     data: Vec<(u32, Vec<u8>)>,
+    /// Offset in `code` of each trapping instruction => trap code.
+    traps: BTreeMap<usize, TrapCode>,
+    /// Number of `u64` slots of the buffer used to pass parameters and results.
+    values_len: usize,
 }
 
 impl Module {
@@ -159,6 +353,7 @@ impl Module {
         wasmparser::Validator::new().validate_all(wasm)?;
 
         let mut types = Vec::new();
+        let mut imports = Vec::new();
         let mut func_types = Vec::new();
         let mut memory_pages = None;
         let mut globals = Vec::new();
@@ -223,7 +418,17 @@ impl Module {
                     }
                 }
                 Payload::CodeSectionEntry(body) => bodies.push(body),
-                Payload::ImportSection(_) => return Err(Error::Unsupported("imports")),
+                Payload::ImportSection(reader) => {
+                    for import in reader.into_imports() {
+                        let import = import?;
+                        let wasmparser::TypeRef::Func(ty) = import.ty else {
+                            return Err(Error::Unsupported("non-function import"));
+                        };
+                        // Imports always precede the function section.
+                        func_types.push(ty);
+                        imports.push((String::from(import.module), String::from(import.name)));
+                    }
+                }
                 Payload::StartSection { .. } => return Err(Error::Unsupported("start function")),
                 Payload::TableSection(_) | Payload::ElementSection(_) => {
                     return Err(Error::Unsupported("tables"));
@@ -233,23 +438,31 @@ impl Module {
             }
         }
 
-        let funcs: Vec<FuncSig> = func_types
+        let funcs = func_types
             .iter()
             .map(|idx| types[*idx as usize].clone())
-            .collect();
+            .collect::<Vec<FuncSig>>();
+        let values_len = funcs
+            .iter()
+            .map(|sig| sig.params.len().max(sig.results.len()))
+            .max()
+            .unwrap_or(0)
+            .max(1);
 
         let isa = build_isa()?;
         let mut linker = Linker::default();
         let mut ctx = Context::new();
         let mut builder_ctx = FunctionBuilderContext::new();
 
-        // Compile all the Wasm functions.
-        for (func_idx, body) in bodies.iter().enumerate() {
+        // Compile all the Wasm functions. Bodies are those of the non-imported functions.
+        for (body_idx, body) in bodies.iter().enumerate() {
+            let func_idx = imports.len() + body_idx;
             ctx.clear();
             ctx.func.signature = funcs[func_idx].to_clif();
             ctx.func.name = UserFuncName::user(NAMESPACE_WASM_FUNC, func_idx as u32);
             let builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
-            let mut translator = Translator::new(builder, &types, &funcs, &globals, func_idx);
+            let mut translator =
+                Translator::new(builder, &types, &funcs, imports.len(), &globals, func_idx);
             translator.translate(body)?;
             translator.builder.finalize(isa.frontend_config());
             linker.add(&isa, &mut ctx, NAMESPACE_WASM_FUNC, func_idx as u32)?;
@@ -257,6 +470,9 @@ impl Module {
 
         // Compile one trampoline per exported function.
         for (export_idx, (_, func_idx)) in exports.iter().enumerate() {
+            if (*func_idx as usize) < imports.len() {
+                return Err(Error::Unsupported("re-exported import"));
+            }
             ctx.clear();
             build_trampoline(
                 &mut ctx.func,
@@ -269,7 +485,7 @@ impl Module {
             linker.add(&isa, &mut ctx, NAMESPACE_TRAMPOLINE, export_idx as u32)?;
         }
 
-        let (code, offsets) = linker.link()?;
+        let (code, offsets, traps) = linker.link()?;
         let exports = exports
             .into_iter()
             .enumerate()
@@ -282,11 +498,20 @@ impl Module {
         Ok(Module {
             code,
             funcs,
+            imports,
             exports,
             memory_pages,
             globals,
             data,
+            traps,
+            values_len,
         })
+    }
+
+    /// Returns the list of imported functions, as `(module name, field name)`, ordered by
+    /// import index.
+    pub fn imports_by_index(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {
+        self.imports.iter().map(|(m, n)| (&m[..], &n[..]))
     }
 }
 
@@ -294,6 +519,13 @@ fn build_isa() -> Result<OwnedTargetIsa, Error> {
     let mut flags = settings::builder();
     flags.set("opt_level", "speed").map_err(|_| Error::Compile)?;
     flags.set("is_pic", "false").map_err(|_| Error::Compile)?;
+    // Makes sure that functions with a large stack frame can't skip over the guard region.
+    flags
+        .set("enable_probestack", "true")
+        .map_err(|_| Error::Compile)?;
+    flags
+        .set("probestack_strategy", "inline")
+        .map_err(|_| Error::Compile)?;
     flags
         .set("enable_multi_ret_implicit_sret", "true")
         .map_err(|_| Error::Compile)?;
@@ -369,6 +601,8 @@ struct Linker {
     offsets: BTreeMap<(u32, u32), usize>,
     /// (offset in `code`, kind, target, addend)
     relocs: Vec<(usize, Reloc, (u32, u32), i64)>,
+    /// Offset in `code` of each trapping instruction => trap code.
+    traps: BTreeMap<usize, TrapCode>,
 }
 
 impl Linker {
@@ -390,6 +624,9 @@ impl Linker {
         self.code.extend_from_slice(compiled.code_buffer());
         self.offsets.insert((namespace, index), base);
         let relocs = compiled.buffer.relocs().to_vec();
+        for trap in compiled.buffer.traps() {
+            self.traps.insert(base + trap.offset as usize, trap.code);
+        }
 
         for reloc in relocs {
             let target = match &reloc.target {
@@ -406,15 +643,22 @@ impl Linker {
         Ok(())
     }
 
-    fn link(self) -> Result<(ExecMemory, BTreeMap<(u32, u32), usize>), Error> {
-        let mut mem = ExecMemory::new(self.code.len().max(1))?;
+    #[allow(clippy::type_complexity)]
+    fn link(
+        self,
+    ) -> Result<(Mmap, BTreeMap<(u32, u32), usize>, BTreeMap<usize, TrapCode>), Error> {
+        let mut mem = Mmap::new(self.code.len().max(1))?;
         let base = mem.ptr as usize;
         unsafe {
             ptr::copy_nonoverlapping(self.code.as_ptr(), mem.ptr, self.code.len());
         }
 
         for (offset, kind, target, addend) in self.relocs {
-            let target_addr = (base + self.offsets[&target]) as i64 + addend;
+            let target_addr = if target == (NAMESPACE_HOST, 0) {
+                (init_vm_yield as *const ()).addr() as i64 + addend
+            } else {
+                (base + self.offsets[&target]) as i64 + addend
+            };
             let at = unsafe { mem.ptr.add(offset) };
             match kind {
                 Reloc::X86CallPCRel4 | Reloc::X86PCRel4 => {
@@ -427,24 +671,26 @@ impl Linker {
             }
         }
 
-        mem.make_executable()?;
-        Ok((mem, self.offsets))
+        mem.protect(0, mem.len, Mmap::PROT_READ | Mmap::PROT_EXEC)?;
+        Ok((mem, self.offsets, self.traps))
     }
 }
 
-/// Memory region obtained through `mmap`, later made executable.
-struct ExecMemory {
+/// Memory region obtained through `mmap`.
+struct Mmap {
     ptr: *mut u8,
     len: usize,
 }
 
-impl ExecMemory {
+impl Mmap {
+    const PROT_NONE: usize = 0x0;
     const PROT_READ: usize = 0x1;
     const PROT_WRITE: usize = 0x2;
     const PROT_EXEC: usize = 0x4;
     const MAP_PRIVATE: usize = 0x02;
     const MAP_ANONYMOUS: usize = 0x20;
 
+    /// Allocates a readable and writable region of the given length.
     fn new(len: usize) -> Result<Self, Error> {
         let ptr = unsafe {
             syscalls::syscall!(
@@ -458,19 +704,21 @@ impl ExecMemory {
             )
         }
         .map_err(|_| Error::Mmap)?;
-        Ok(ExecMemory {
+        Ok(Mmap {
             ptr: ptr as *mut u8,
             len,
         })
     }
 
-    fn make_executable(&mut self) -> Result<(), Error> {
+    /// Changes the protection of the given page-aligned range of the region.
+    fn protect(&mut self, offset: usize, len: usize, prot: usize) -> Result<(), Error> {
+        assert!(offset + len <= self.len);
         unsafe {
             syscalls::syscall!(
                 syscalls::Sysno::mprotect,
-                self.ptr as usize,
-                self.len,
-                Self::PROT_READ | Self::PROT_EXEC
+                self.ptr as usize + offset,
+                len,
+                prot
             )
         }
         .map_err(|_| Error::Mmap)?;
@@ -478,7 +726,7 @@ impl ExecMemory {
     }
 }
 
-impl Drop for ExecMemory {
+impl Drop for Mmap {
     fn drop(&mut self) {
         unsafe {
             let _ = syscalls::syscall!(syscalls::Sysno::munmap, self.ptr as usize, self.len);
@@ -486,17 +734,194 @@ impl Drop for ExecMemory {
     }
 }
 
-/// An instantiated module, with its own memory and globals.
+/// Proof that the signal handlers that catch traps have been installed.
+///
+/// See [`install_trap_handlers`].
+pub struct TrapHandlers {
+    _private: (),
+}
+
+/// Layout of `struct sigaction` as expected by the `rt_sigaction` system call on x86-64.
+#[repr(C)]
+struct KernelSigaction {
+    handler: usize,
+    flags: u64,
+    restorer: usize,
+    mask: u64,
+}
+
+/// Layout of `stack_t` as expected by the `sigaltstack` system call on x86-64.
+#[repr(C)]
+struct KernelStack {
+    sp: usize,
+    flags: i32,
+    size: usize,
+}
+
+impl KernelSigaction {
+    const SIG_DFL: usize = 0;
+    const SA_SIGINFO: u64 = 0x4;
+    const SA_ONSTACK: u64 = 0x0800_0000;
+    const SA_RESTORER: u64 = 0x0400_0000;
+    const SIGILL: u32 = 4;
+    const SIGFPE: u32 = 8;
+    const SIGSEGV: u32 = 11;
+}
+
+/// Installs process-wide handlers for `SIGILL`, `SIGFPE` and `SIGSEGV`, which are necessary in
+/// order to recover from traps in Wasm code.
+///
+/// Faults that don't originate from Wasm code restore the default action of the signal, which
+/// terminates the process. In particular, this replaces the handler that the Rust standard
+/// library installs to report stack overflows of the host.
+///
+/// Also makes sure that the current thread has an alternate signal stack, which is necessary
+/// in order to handle stack overflows of the Wasm code. The Rust standard library normally
+/// already installs one on every thread. Wasm code must only be executed on threads that have
+/// an alternate signal stack.
+///
+/// # Safety
+///
+/// No other code must install handlers for these signals afterwards.
+pub unsafe fn install_trap_handlers() -> Result<TrapHandlers, Error> {
+    let mut current_stack = KernelStack {
+        sp: 0,
+        flags: 0,
+        size: 0,
+    };
+    unsafe {
+        syscalls::syscall!(
+            syscalls::Sysno::sigaltstack,
+            0usize,
+            &raw mut current_stack as usize
+        )
+    }
+    .map_err(|_| Error::SignalHandlers)?;
+    // `SS_DISABLE` is 2.
+    if current_stack.flags & 2 != 0 {
+        let stack = Mmap::new(STACK_GUARD_SIZE)?;
+        let new_stack = KernelStack {
+            sp: stack.ptr as usize,
+            flags: 0,
+            size: stack.len,
+        };
+        unsafe {
+            syscalls::syscall!(
+                syscalls::Sysno::sigaltstack,
+                &raw const new_stack as usize,
+                0usize
+            )
+        }
+        .map_err(|_| Error::SignalHandlers)?;
+        // The alternate stack must remain valid for as long as the thread exists.
+        core::mem::forget(stack);
+    }
+
+    let action = KernelSigaction {
+        handler: (trap_signal_handler as *const ()).addr(),
+        flags: KernelSigaction::SA_SIGINFO
+            | KernelSigaction::SA_ONSTACK
+            | KernelSigaction::SA_RESTORER,
+        restorer: (init_vm_sigreturn as *const ()).addr(),
+        mask: 0,
+    };
+    for signal in [
+        KernelSigaction::SIGILL,
+        KernelSigaction::SIGFPE,
+        KernelSigaction::SIGSEGV,
+    ] {
+        unsafe {
+            syscalls::syscall!(
+                syscalls::Sysno::rt_sigaction,
+                signal,
+                &raw const action as usize,
+                0usize,
+                8usize
+            )
+        }
+        .map_err(|_| Error::SignalHandlers)?;
+    }
+
+    Ok(TrapHandlers { _private: () })
+}
+
+/// Handler of `SIGILL`, `SIGFPE` and `SIGSEGV`.
+///
+/// If the fault comes from Wasm code, records the details of the fault in the `VmCtx` and
+/// modifies the interrupted context so that the execution continues in `init_vm_trap_landing`.
+unsafe extern "C" fn trap_signal_handler(signal: u32, info: *mut u8, context: *mut u8) {
+    // Offsets in `siginfo_t` and `ucontext_t` on x86-64 Linux.
+    const SI_ADDR_OFFSET: usize = 16;
+    const GREGS_OFFSET: usize = 40;
+    const REG_RDI: usize = 8;
+    const REG_RIP: usize = 16;
+
+    unsafe {
+        let gregs = context.add(GREGS_OFFSET).cast::<u64>();
+        let pc = gregs.add(REG_RIP).read_unaligned();
+        let fault_addr = info.add(SI_ADDR_OFFSET).cast::<u64>().read_unaligned();
+
+        let vmctx = CURRENT_VMCTX.get();
+        if !vmctx.is_null() {
+            let in_code = pc >= (*vmctx).code_start && pc < (*vmctx).code_end;
+            let in_guard = signal == KernelSigaction::SIGSEGV
+                && fault_addr >= (*vmctx).guard_start
+                && fault_addr < (*vmctx).guard_end;
+            if in_code || in_guard {
+                (*vmctx).trap_signal = signal;
+                (*vmctx).trap_pc = pc;
+                (*vmctx).trap_addr = fault_addr;
+                gregs
+                    .add(REG_RIP)
+                    .write_unaligned((init_vm_trap_landing as *const ()).addr() as u64);
+                gregs.add(REG_RDI).write_unaligned(vmctx as u64);
+                return;
+            }
+        }
+
+        // Not a Wasm trap. Restore the default action. The faulting instruction is executed
+        // again when the handler returns, which then terminates the process.
+        let action = KernelSigaction {
+            handler: KernelSigaction::SIG_DFL,
+            flags: 0,
+            restorer: 0,
+            mask: 0,
+        };
+        let _ = syscalls::syscall!(
+            syscalls::Sysno::rt_sigaction,
+            signal,
+            &raw const action as usize,
+            0usize,
+            8usize
+        );
+    }
+}
+
+/// An instantiated module, with its own memory, globals, and native stack.
 pub struct Instance<'m> {
     module: &'m Module,
-    vmctx: Box<VmCtx>,
+    /// Obtained from `Box::into_raw`. Accessed by the compiled code, hence why it is a raw
+    /// pointer.
+    vmctx: *mut VmCtx,
+    state: InstanceState,
+    /// Native stack on which the Wasm code runs. The first `STACK_GUARD_SIZE` bytes are
+    /// inaccessible.
+    stack: Mmap,
     // These fields are accessed through raw pointers in `vmctx`.
     _memory: Vec<u8>,
     _globals: Vec<u64>,
+    _values: Vec<u64>,
+}
+
+enum InstanceState {
+    /// No execution is in progress.
+    Idle,
+    /// The execution of `export_func` is suspended while the host executes `import`.
+    Suspended { export_func: u32, import: u32 },
 }
 
 impl<'m> Instance<'m> {
-    pub fn new(module: &'m Module) -> Result<Self, Error> {
+    pub fn new(module: &'m Module, _trap_handlers: &TrapHandlers) -> Result<Self, Error> {
         let mem_len = module.memory_pages.unwrap_or(0) * WASM_PAGE_SIZE;
         let mut memory = vec![0u8; usize::try_from(mem_len).map_err(|_| Error::Mmap)?];
         for (offset, bytes) in &module.data {
@@ -509,64 +934,194 @@ impl<'m> Instance<'m> {
             dest.copy_from_slice(bytes);
         }
 
-        let mut globals: Vec<u64> = module
+        let mut globals = module
             .globals
             .iter()
             .map(|g| match *g {
                 Value::I32(v) => u64::from(v as u32),
                 Value::I64(v) => v as u64,
             })
-            .collect();
+            .collect::<Vec<u64>>();
 
-        let vmctx = Box::new(VmCtx {
+        let mut values = vec![0u64; module.values_len];
+
+        let mut stack = Mmap::new(STACK_GUARD_SIZE + STACK_SIZE)?;
+        stack.protect(0, STACK_GUARD_SIZE, Mmap::PROT_NONE)?;
+
+        let code_start = module.code.ptr as u64;
+        let guard_start = stack.ptr as u64;
+        let vmctx = Box::into_raw(Box::new(VmCtx {
             mem_base: memory.as_mut_ptr(),
             mem_len,
             globals: globals.as_mut_ptr(),
-        });
+            values: values.as_mut_ptr(),
+            import_idx: 0,
+            trap_signal: 0,
+            trap_pc: 0,
+            trap_addr: 0,
+            host_rsp: 0,
+            wasm_rsp: 0,
+            code_start,
+            code_end: code_start + module.code.len as u64,
+            guard_start,
+            guard_end: guard_start + STACK_GUARD_SIZE as u64,
+        }));
 
         Ok(Instance {
             module,
             vmctx,
+            state: InstanceState::Idle,
+            stack,
             _memory: memory,
             _globals: globals,
+            _values: values,
         })
     }
 
-    /// Calls the exported function with the given name.
-    pub fn call(&mut self, export: &str, args: &[Value]) -> Result<Vec<Value>, Error> {
-        let (func_idx, offset) = *self.module.exports.get(export).ok_or(Error::NoSuchExport)?;
-        let sig = &self.module.funcs[func_idx as usize];
+    /// Starts executing the exported function with the given name.
+    ///
+    /// If the execution of a previous call is suspended, it is discarded.
+    pub fn call(&mut self, export: &str, args: &[Value]) -> Result<Outcome, Error> {
+        let module = self.module;
+        let (func_idx, offset) = *module.exports.get(export).ok_or(Error::NoSuchExport)?;
+        self.write_values(&module.funcs[func_idx as usize].params, args)?;
+        self.state = InstanceState::Idle;
 
-        if args.len() != sig.params.len() {
+        // Prepare the Wasm stack so that `init_vm_switch` "returns" into `init_vm_fiber_start`
+        // with the expected registers, and with a stack pointer aligned on 16 bytes.
+        let stack_top = self.stack.ptr as u64 + self.stack.len as u64;
+        let frame: [u64; 9] = [
+            0,                                      // r15
+            module.code.ptr as u64 + offset as u64, // r14: trampoline
+            unsafe { (*self.vmctx).values } as u64, // r13
+            self.vmctx as u64,                      // r12
+            0,                                      // rbx
+            0,                                      // rbp
+            (init_vm_fiber_start as *const ()).addr() as u64,    // return address
+            0,
+            0,
+        ];
+        let frame_start = stack_top - 9 * 8;
+        unsafe {
+            ptr::copy_nonoverlapping(frame.as_ptr(), frame_start as *mut u64, frame.len());
+            (*self.vmctx).wasm_rsp = frame_start;
+        }
+
+        self.run(func_idx)
+    }
+
+    /// Resumes the execution suspended in a call to an import, passing the given return values
+    /// of that import.
+    pub fn resume(&mut self, results: &[Value]) -> Result<Outcome, Error> {
+        let InstanceState::Suspended {
+            export_func,
+            import,
+        } = self.state
+        else {
+            return Err(Error::NotSuspended);
+        };
+        let module = self.module;
+        self.write_values(&module.funcs[import as usize].results, results)?;
+        self.run(export_func)
+    }
+
+    /// Switches to the Wasm stack, and returns when the execution of `export_func` finishes,
+    /// gets suspended, or traps.
+    fn run(&mut self, export_func: u32) -> Result<Outcome, Error> {
+        let vmctx = self.vmctx;
+        let previous = CURRENT_VMCTX.replace(vmctx);
+        let outcome = unsafe {
+            init_vm_switch(&raw mut (*vmctx).host_rsp, (*vmctx).wasm_rsp, 0)
+        };
+        CURRENT_VMCTX.set(previous);
+
+        let module = self.module;
+        match outcome {
+            OUTCOME_FINISHED => {
+                self.state = InstanceState::Idle;
+                Ok(Outcome::Return(
+                    self.read_values(&module.funcs[export_func as usize].results),
+                ))
+            }
+            OUTCOME_IMPORT => {
+                let import = unsafe { (*vmctx).import_idx };
+                self.state = InstanceState::Suspended {
+                    export_func,
+                    import,
+                };
+                Ok(Outcome::ImportCall {
+                    import,
+                    args: self.read_values(&module.funcs[import as usize].params),
+                })
+            }
+            OUTCOME_TRAP => {
+                self.state = InstanceState::Idle;
+                let (signal, pc, fault_addr) =
+                    unsafe { ((*vmctx).trap_signal, (*vmctx).trap_pc, (*vmctx).trap_addr) };
+                let in_guard = unsafe {
+                    fault_addr >= (*vmctx).guard_start && fault_addr < (*vmctx).guard_end
+                };
+                let trap = if signal == KernelSigaction::SIGSEGV && in_guard {
+                    Trap::StackOverflow
+                } else {
+                    let code_offset = usize::try_from(pc - module.code.ptr as u64)
+                        .unwrap_or_else(|_| unreachable!());
+                    match module.traps.get(&code_offset) {
+                        Some(&TrapCode::HEAP_OUT_OF_BOUNDS) => Trap::OutOfBounds,
+                        Some(&TrapCode::INTEGER_DIVISION_BY_ZERO) => Trap::DivisionByZero,
+                        Some(&TrapCode::INTEGER_OVERFLOW) => Trap::IntegerOverflow,
+                        Some(&TrapCode::STACK_OVERFLOW) => Trap::StackOverflow,
+                        Some(code) if Some(*code) == TrapCode::user(1) => Trap::Unreachable,
+                        _ => Trap::Unknown,
+                    }
+                };
+                Err(Error::Trap(trap))
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Writes the given values to the buffer shared with the Wasm code, after checking that
+    /// they match the given types.
+    fn write_values(&mut self, tys: &[ir::Type], values: &[Value]) -> Result<(), Error> {
+        if values.len() != tys.len() {
             return Err(Error::BadArgs);
         }
-        let mut values = vec![0u64; sig.params.len().max(sig.results.len()).max(1)];
-        for ((arg, ty), slot) in args.iter().zip(&sig.params).zip(&mut values) {
-            *slot = match (*arg, *ty) {
+        for (i, (value, ty)) in values.iter().zip(tys).enumerate() {
+            let raw = match (*value, *ty) {
                 (Value::I32(v), types::I32) => u64::from(v as u32),
                 (Value::I64(v), types::I64) => v as u64,
                 _ => return Err(Error::BadArgs),
             };
+            // `values_len` is at least the number of parameters and results of every function.
+            unsafe { (*self.vmctx).values.add(i).write(raw) };
         }
+        Ok(())
+    }
 
-        unsafe {
-            let trampoline: extern "sysv64" fn(*mut VmCtx, *mut u64) =
-                std::mem::transmute(self.module.code.ptr.add(offset));
-            trampoline(&mut *self.vmctx, values.as_mut_ptr());
-        }
-
-        Ok(sig
-            .results
-            .iter()
-            .zip(values)
-            .map(|(ty, v)| {
+    /// Reads values of the given types from the buffer shared with the Wasm code.
+    fn read_values(&self, tys: &[ir::Type]) -> Vec<Value> {
+        tys.iter()
+            .enumerate()
+            .map(|(i, ty)| {
+                // `values_len` is at least the number of parameters and results of every
+                // function.
+                let raw = unsafe { (*self.vmctx).values.add(i).read() };
                 if *ty == types::I32 {
-                    Value::I32(v as u32 as i32)
+                    Value::I32(raw as u32 as i32)
                 } else {
-                    Value::I64(v as i64)
+                    Value::I64(raw as i64)
                 }
             })
-            .collect())
+            .collect::<Vec<_>>()
+    }
+}
+
+impl Drop for Instance<'_> {
+    fn drop(&mut self) {
+        // The Wasm stack contains no Rust frames, so a suspended execution can simply be
+        // discarded.
+        unsafe { drop(Box::from_raw(self.vmctx)) };
     }
 }
 
@@ -603,6 +1158,8 @@ struct Translator<'a> {
     builder: FunctionBuilder<'a>,
     types: &'a [FuncSig],
     funcs: &'a [FuncSig],
+    /// Number of imported functions, which are the first entries of `funcs`.
+    num_imports: usize,
     globals: &'a [Value],
     func_idx: usize,
     vmctx: ir::Value,
@@ -611,6 +1168,8 @@ struct Translator<'a> {
     frames: Vec<Frame>,
     reachable: bool,
     func_refs: BTreeMap<u32, ir::FuncRef>,
+    /// Reference to `init_vm_yield`, if already declared.
+    yield_ref: Option<ir::FuncRef>,
 }
 
 impl<'a> Translator<'a> {
@@ -618,6 +1177,7 @@ impl<'a> Translator<'a> {
         mut builder: FunctionBuilder<'a>,
         types: &'a [FuncSig],
         funcs: &'a [FuncSig],
+        num_imports: usize,
         globals: &'a [Value],
         func_idx: usize,
     ) -> Self {
@@ -630,6 +1190,7 @@ impl<'a> Translator<'a> {
             builder,
             types,
             funcs,
+            num_imports,
             globals,
             func_idx,
             vmctx,
@@ -638,6 +1199,7 @@ impl<'a> Translator<'a> {
             frames: Vec::new(),
             reachable: true,
             func_refs: BTreeMap::new(),
+            yield_ref: None,
         }
     }
 
@@ -966,6 +1528,63 @@ impl<'a> Translator<'a> {
                 let rets = self.stack[self.stack.len() - n..].to_vec();
                 self.builder.ins().return_(&rets);
                 self.reachable = false;
+            }
+            Operator::Call { function_index }
+                if (function_index as usize) < self.num_imports =>
+            {
+                // Calling an import consists in writing the parameters to the values buffer,
+                // then switching back to the host, which writes the results to the values
+                // buffer before resuming the execution.
+                let funcs = self.funcs;
+                let sig = &funcs[function_index as usize];
+                let values = self.vmctx_load(offset_of!(VmCtx, values));
+                let args = self.stack.split_off(self.stack.len() - sig.params.len());
+                for (i, arg) in args.into_iter().enumerate() {
+                    let arg = if self.builder.func.dfg.value_type(arg) == i64t {
+                        arg
+                    } else {
+                        self.builder.ins().uextend(i64t, arg)
+                    };
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::trusted(), arg, values, (i * 8) as i32);
+                }
+                let import_idx = self.builder.ins().iconst(i32t, i64::from(function_index));
+                self.builder.ins().store(
+                    MemFlagsData::trusted(),
+                    import_idx,
+                    self.vmctx,
+                    offset_of!(VmCtx, import_idx) as i32,
+                );
+                let yield_ref = match self.yield_ref {
+                    Some(r) => r,
+                    None => {
+                        let mut yield_sig = Signature::new(CallConv::SystemV);
+                        yield_sig.params.push(AbiParam::new(i64t));
+                        let signature = self.builder.import_signature(yield_sig);
+                        let name = self.builder.func.declare_imported_user_function(
+                            UserExternalName::new(NAMESPACE_HOST, 0),
+                        );
+                        let r = self.builder.import_function(ExtFuncData {
+                            name: ExternalName::user(name),
+                            signature,
+                            colocated: false,
+                            patchable: false,
+                        });
+                        self.yield_ref = Some(r);
+                        r
+                    }
+                };
+                self.builder.ins().call(yield_ref, &[self.vmctx]);
+                for (i, ty) in sig.results.iter().enumerate() {
+                    let v = self.builder.ins().load(
+                        *ty,
+                        MemFlagsData::trusted(),
+                        values,
+                        (i * 8) as i32,
+                    );
+                    self.stack.push(v);
+                }
             }
             Operator::Call { function_index } => {
                 let funcs = self.funcs;
