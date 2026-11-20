@@ -1,9 +1,17 @@
 use std::{fs, path::Path, path::PathBuf, process};
 
+/// Configuration passed to [`build_init`].
+pub struct Config {
+    /// Secret key embedded in the init program and passed to `init::run()`.
+    pub secret_key: [u8; 32],
+    /// Messages embedded in the init program and passed to `init::run()`.
+    pub initial_executor_messages: Vec<u8>,
+}
+
 /// Builds the init program and returns the path to the resulting executable.
 ///
 /// The `init` crate is a library. This function creates a temporary Cargo project that depends
-/// on it and whose `main` function calls `init::run()` with a randomly-generated secret key,
+/// on it and whose `main` function calls `init::run()` with the values found in `config`,
 /// then builds that project.
 /// The build artifacts are stored in the `target` directory at the root of the repository, so
 /// that they are kept between builds even though the temporary project is deleted.
@@ -11,7 +19,7 @@ use std::{fs, path::Path, path::PathBuf, process};
 /// # Panic
 ///
 /// Panics if creating the temporary project fails or if the build fails.
-pub fn build_init() -> PathBuf {
+pub fn build_init(config: Config) -> PathBuf {
     let project_root = Path::new(&env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(1)
@@ -34,24 +42,32 @@ pub fn build_init() -> PathBuf {
          \n\
          [dependencies]\n\
          init = {{ path = {:?} }}\n",
-        init_dir.to_str().unwrap_or_else(|| panic!("non-UTF-8 project path")),
+        init_dir
+            .to_str()
+            .unwrap_or_else(|| panic!("non-UTF-8 project path")),
     );
     fs::write(tmp.path().join("Cargo.toml"), cargo_toml)
         .unwrap_or_else(|err| panic!("failed to write Cargo.toml: {err}"));
     fs::create_dir(tmp.path().join("src"))
         .unwrap_or_else(|err| panic!("failed to create src directory: {err}"));
-    // The `Debug` implementation of `[u8; 32]` produces a valid Rust array expression.
-    let secret_key = rand::random::<[u8; 32]>();
+    fs::write(
+        tmp.path().join("src").join("initial_executor_messages.bin"),
+        &config.initial_executor_messages,
+    )
+    .unwrap_or_else(|err| panic!("failed to write initial_executor_messages.bin: {err}"));
+    fs::write(
+        tmp.path().join("src").join("secret_key.bin"),
+        config.secret_key,
+    )
+    .unwrap_or_else(|err| panic!("failed to write secret_key.bin: {err}"));
     fs::write(
         tmp.path().join("src").join("main.rs"),
-        format!(
-            "fn main() {{\n    \
-                 init::run(init::Config {{\n        \
-                     secret_key: {secret_key:?},\n        \
-                     initial_executor_messages: &[],\n    \
-                 }})\n\
-             }}\n"
-        ),
+        "fn main() {\n    \
+             init::run(init::Config {\n        \
+                 secret_key: *include_bytes!(\"secret_key.bin\"),\n        \
+                 initial_executor_messages: include_bytes!(\"initial_executor_messages.bin\"),\n    \
+             })\n\
+         }\n",
     )
     .unwrap_or_else(|err| panic!("failed to write main.rs: {err}"));
     // Reuse the lock file of `init` so that dependency versions stay pinned.

@@ -13,7 +13,10 @@ fn main() {
 
     let bzimage = build_kernel::build_kernel(&project_root).unwrap();
 
-    let init = build_init::build_init();
+    let init = build_init::build_init(build_init::Config {
+        secret_key: rand::random::<[u8; 32]>(),
+        initial_executor_messages: Vec::new(),
+    });
 
     disk_image::build_disk_image(
         bzimage,
