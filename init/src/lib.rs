@@ -3,7 +3,7 @@ mod vm;
 
 /// Configuration passed to [`run`].
 pub struct Config {
-    /// Secret key of the node.
+    /// Secret key of the program.
     pub secret_key: [u8; 32],
 
     /// Messages initially delivered to the implementer of the `executor` interface.
