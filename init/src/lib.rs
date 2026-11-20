@@ -1,3 +1,4 @@
+mod executor;
 mod vm;
 
 /// Entry point of the init program. Runs the tests and then pauses forever.
