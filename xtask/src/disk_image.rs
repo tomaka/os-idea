@@ -1,8 +1,10 @@
+use core::fmt;
 use std::{fs, io, path::Path};
 
 pub fn build_disk_image(
     kernel_file_path: impl AsRef<Path>,
     init_program_path: impl AsRef<Path>,
+    wasm_programs: impl Iterator<Item = ([u8; 32], impl AsRef<Path>)>,
     disk_image_path: impl AsRef<Path>,
 ) -> Result<(), io::Error> {
     let mut file = fs::OpenOptions::new()
@@ -11,7 +13,7 @@ pub fn build_disk_image(
         .create(true)
         .truncate(true)
         .open(disk_image_path)?;
-    file.set_len(512 * 1024 * 1024)?;
+    file.set_len(512 * 1024 * 1024)?; // TODO: big enough?
     file.sync_data()?;
 
     let (mut file, start_sector, sectors_length) = {
@@ -78,6 +80,18 @@ pub fn build_disk_image(
                 let mut initramfs_writer = root_dir.create_file("initramfs.cpio.gz")?;
                 let init_program = fs::read(init_program_path)?;
                 io::Write::write_all(&mut initramfs_writer, &initramfs(&init_program))?;
+
+                for (hash, program_path) in wasm_programs {
+                    let mut file_name = String::with_capacity(hash.len() * 2 + 5);
+                    for byte in hash {
+                        fmt::Write::write_fmt(&mut file_name, format_args!("{byte:02x}"))
+                            .unwrap_or_else(|_| unreachable!());
+                    }
+                    file_name.push_str(".wasm");
+
+                    let mut program_writer = root_dir.create_file(&file_name)?;
+                    io::copy(&mut fs::File::open(program_path)?, &mut program_writer)?;
+                }
             }
 
             fs.unmount()?;

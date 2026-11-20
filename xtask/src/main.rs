@@ -15,5 +15,11 @@ fn main() {
 
     let init = build_init::build_init();
 
-    disk_image::build_disk_image(bzimage, init, "image.img").unwrap();
+    disk_image::build_disk_image(
+        bzimage,
+        init,
+        core::iter::empty::<([u8; 32], &Path)>(),
+        "image.img",
+    )
+    .unwrap();
 }
