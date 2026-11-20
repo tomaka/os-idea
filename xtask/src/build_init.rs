@@ -44,7 +44,14 @@ pub fn build_init() -> PathBuf {
     let secret_key = rand::random::<[u8; 32]>();
     fs::write(
         tmp.path().join("src").join("main.rs"),
-        format!("fn main() {{ init::run({secret_key:?}) }}\n"),
+        format!(
+            "fn main() {{\n    \
+                 init::run(init::Config {{\n        \
+                     secret_key: {secret_key:?},\n        \
+                     initial_executor_messages: &[],\n    \
+                 }})\n\
+             }}\n"
+        ),
     )
     .unwrap_or_else(|err| panic!("failed to write main.rs: {err}"));
     // Reuse the lock file of `init` so that dependency versions stay pinned.

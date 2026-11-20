@@ -1,12 +1,22 @@
 mod executor;
 mod vm;
 
+/// Configuration passed to [`run`].
+pub struct Config {
+    /// Secret key of the node.
+    pub secret_key: [u8; 32],
+
+    /// Messages initially delivered to the implementer of the `executor` interface.
+    /// Contains zero or more messages concatenated together with no separator in-between.
+    pub initial_executor_messages: &'static [u8],
+}
+
 /// Entry point of the init program. Runs the tests and then pauses forever.
-pub fn run(secret_key: [u8; 32]) -> ! {
+pub fn run(config: Config) -> ! {
     let available_programs =
         scan_available_programs_unordered().collect::<hashbrown::HashSet<_, fnv::FnvBuildHasher>>();
 
-    let secret_key = x25519_dalek::StaticSecret::from(secret_key);
+    let secret_key = x25519_dalek::StaticSecret::from(config.secret_key);
 
     println!("Hello world");
 
