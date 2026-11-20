@@ -1,5 +1,6 @@
 use std::path::Path;
 
+mod build;
 mod build_init;
 mod build_kernel;
 mod disk_image;
@@ -11,18 +12,11 @@ fn main() {
         .unwrap()
         .to_path_buf();
 
-    let bzimage = build_kernel::build_kernel(&project_root).unwrap();
-
-    let init = build_init::build_init(build_init::Config {
-        secret_key: rand::random::<[u8; 32]>(),
-        initial_executor_messages: Vec::new(),
-    });
-
-    disk_image::build_disk_image(
+    let build::BuildOutput {
         bzimage,
         init,
-        core::iter::empty::<([u8; 32], &Path)>(),
-        "image.img",
-    )
-    .unwrap();
+        wasm_programs,
+    } = build::build(&project_root);
+
+    disk_image::build_disk_image(bzimage, init, wasm_programs.into_iter(), "image.img").unwrap();
 }

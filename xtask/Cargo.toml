@@ -16,3 +16,4 @@ tar = "0.4.45"
 tempfile = "3"
 tokio = { version = "1.52", features = ["rt-multi-thread"] }
 uuid = "1"
+x25519-dalek = { version = "3.0.0", default-features = false, features = ["static_secrets"] }
