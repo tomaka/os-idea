@@ -45,6 +45,31 @@ use quote::quote;
 /// uses CDDL features that can't be converted to Rust types.
 #[proc_macro]
 pub fn interface_bindings(tokens: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    interface_bindings_common(tokens, true)
+}
+
+/// Same as [`interface_bindings!`], except that the `emit_foo` functions aren't generated.
+///
+/// The generated module only contains the type definitions.
+///
+/// ```ignore
+/// interface_bindings::interface_bindings_definitions_only!("interfaces/executor.cddl");
+/// ```
+#[proc_macro]
+pub fn interface_bindings_definitions_only(
+    tokens: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    interface_bindings_common(tokens, false)
+}
+
+/// Common implementation of [`interface_bindings!`] and
+/// [`interface_bindings_definitions_only!`].
+///
+/// If `with_emit_functions` is `false`, the `emit_foo` functions aren't generated.
+fn interface_bindings_common(
+    tokens: proc_macro::TokenStream,
+    with_emit_functions: bool,
+) -> proc_macro::TokenStream {
     let path_literal = syn::parse_macro_input!(tokens as syn::LitStr);
 
     let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") else {
@@ -108,7 +133,7 @@ pub fn interface_bindings(tokens: proc_macro::TokenStream) -> proc_macro::TokenS
         }
     };
 
-    let content = match generate(&definition) {
+    let content = match generate(&definition, with_emit_functions) {
         Ok(content) => content,
         Err(err) => {
             return syn::Error::new_spanned(
@@ -139,7 +164,13 @@ pub fn interface_bindings(tokens: proc_macro::TokenStream) -> proc_macro::TokenS
 }
 
 /// Generates the content of the module corresponding to the given interface definition.
-fn generate(definition: &interface_parser::InterfaceDefinition) -> Result<TokenStream, String> {
+///
+/// If `with_emit_functions` is `false`, the `emit_foo` functions aren't generated. The messages
+/// are still validated and the types of their responses are still generated.
+fn generate(
+    definition: &interface_parser::InterfaceDefinition,
+    with_emit_functions: bool,
+) -> Result<TokenStream, String> {
     let root_name = definition.rules[0].name.as_str();
 
     let mut generator = Generator {
@@ -235,12 +266,14 @@ fn generate(definition: &interface_parser::InterfaceDefinition) -> Result<TokenS
             None => (quote!(), quote!()),
         };
 
-        emit_functions.push(quote! {
-            pub fn #function_ident #generics (request: &#request_type) #return_type {
-                let _ = request;
-                unimplemented!()
-            }
-        });
+        if with_emit_functions {
+            emit_functions.push(quote! {
+                pub fn #function_ident #generics (request: &#request_type) #return_type {
+                    let _ = request;
+                    unimplemented!()
+                }
+            });
+        }
     }
 
     let items = generator.items;
