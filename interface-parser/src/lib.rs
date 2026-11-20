@@ -328,6 +328,32 @@ pub struct InterfaceDefinition {
     pub rules: Vec<Rule>,
 }
 
+impl InterfaceDefinition {
+    /// Returns a BLAKE3 hash of the structure of the interface.
+    ///
+    /// The hash takes into account all the rules of the document, in order, including their
+    /// names, the names of their generic parameters, and their kind of assignment.
+    ///
+    /// The following differences don't modify the hash:
+    ///
+    /// - Comments, whitespaces, and more generally the location of the definitions within the
+    ///   document.
+    /// - Using `bytes` instead of `bstr`, `text` instead of `tstr`, or `null` instead of `nil`.
+    /// - The order of type choices (`foo / bar`) and of group choices (`foo // bar`).
+    pub fn hash(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(
+            &u64::try_from(self.rules.len())
+                .unwrap_or_else(|_| unreachable!())
+                .to_le_bytes(),
+        );
+        for rule in &self.rules {
+            rule.hash_into(&mut hasher);
+        }
+        *hasher.finalize().as_bytes()
+    }
+}
+
 /// Message that can be sent over an interface.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
@@ -862,4 +888,338 @@ fn check_reference(
     }
 
     Ok(())
+}
+
+/// Writes to `hasher` the given name, taking into account the aliases of the standard prelude.
+fn hash_name(hasher: &mut blake3::Hasher, name: &str) {
+    let name = match name {
+        "bytes" => "bstr",
+        "text" => "tstr",
+        "null" => "nil",
+        other => other,
+    };
+    hasher.update(
+        &u64::try_from(name.len())
+            .unwrap_or_else(|_| unreachable!())
+            .to_le_bytes(),
+    );
+    hasher.update(name.as_bytes());
+}
+
+/// Writes to `hasher` the given name and list of generic arguments.
+fn hash_reference(hasher: &mut blake3::Hasher, name: &str, generic_arguments: &[Type1]) {
+    hash_name(hasher, name);
+    hasher.update(
+        &u64::try_from(generic_arguments.len())
+            .unwrap_or_else(|_| unreachable!())
+            .to_le_bytes(),
+    );
+    for argument in generic_arguments {
+        argument.hash_into(hasher);
+    }
+}
+
+impl Rule {
+    /// Writes the rule to `hasher`. See [`InterfaceDefinition::hash`].
+    fn hash_into(&self, hasher: &mut blake3::Hasher) {
+        hash_name(hasher, &self.name);
+        hasher.update(
+            &u64::try_from(self.generic_parameters.len())
+                .unwrap_or_else(|_| unreachable!())
+                .to_le_bytes(),
+        );
+        for parameter in &self.generic_parameters {
+            hash_name(hasher, parameter);
+        }
+        hasher.update(&[match self.assignment {
+            Assignment::Define => 0,
+            Assignment::TypeChoiceExtension => 1,
+            Assignment::GroupChoiceExtension => 2,
+        }]);
+        match &self.body {
+            RuleBody::Type(ty) => {
+                hasher.update(&[0]);
+                ty.hash_into(hasher);
+            }
+            RuleBody::GroupEntry(entry) => {
+                hasher.update(&[1]);
+                entry.hash_into(hasher);
+            }
+        }
+    }
+}
+
+impl Type {
+    /// Writes the type to `hasher`, in a way that doesn't depend on the order of the choices.
+    fn hash_into(&self, hasher: &mut blake3::Hasher) {
+        let mut choices = self
+            .choices
+            .iter()
+            .map(|choice| {
+                let mut choice_hasher = blake3::Hasher::new();
+                choice.hash_into(&mut choice_hasher);
+                *choice_hasher.finalize().as_bytes()
+            })
+            .collect::<Vec<[u8; 32]>>();
+        choices.sort_unstable();
+        hasher.update(
+            &u64::try_from(choices.len())
+                .unwrap_or_else(|_| unreachable!())
+                .to_le_bytes(),
+        );
+        for choice in &choices {
+            hasher.update(choice);
+        }
+    }
+}
+
+impl Type1 {
+    /// Writes the type to `hasher`. See [`InterfaceDefinition::hash`].
+    fn hash_into(&self, hasher: &mut blake3::Hasher) {
+        self.target.hash_into(hasher);
+        match &self.operator {
+            None => {
+                hasher.update(&[0]);
+            }
+            Some((Operator::InclusiveRange, right)) => {
+                hasher.update(&[1]);
+                right.hash_into(hasher);
+            }
+            Some((Operator::ExclusiveRange, right)) => {
+                hasher.update(&[2]);
+                right.hash_into(hasher);
+            }
+            Some((Operator::Control(name), right)) => {
+                hasher.update(&[3]);
+                hasher.update(
+                    &u64::try_from(name.len())
+                        .unwrap_or_else(|_| unreachable!())
+                        .to_le_bytes(),
+                );
+                hasher.update(name.as_bytes());
+                right.hash_into(hasher);
+            }
+        }
+    }
+}
+
+impl Type2 {
+    /// Writes the type to `hasher`. See [`InterfaceDefinition::hash`].
+    fn hash_into(&self, hasher: &mut blake3::Hasher) {
+        match self {
+            Type2::Value(value) => {
+                hasher.update(&[0]);
+                value.hash_into(hasher);
+            }
+            Type2::Name {
+                name,
+                generic_arguments,
+            } => {
+                hasher.update(&[1]);
+                hash_reference(hasher, name, generic_arguments);
+            }
+            Type2::Parenthesized(ty) => {
+                hasher.update(&[2]);
+                ty.hash_into(hasher);
+            }
+            Type2::Map(group) => {
+                hasher.update(&[3]);
+                group.hash_into(hasher);
+            }
+            Type2::Array(group) => {
+                hasher.update(&[4]);
+                group.hash_into(hasher);
+            }
+            Type2::Unwrap {
+                name,
+                generic_arguments,
+            } => {
+                hasher.update(&[5]);
+                hash_reference(hasher, name, generic_arguments);
+            }
+            Type2::ChoiceFromGroup(group) => {
+                hasher.update(&[6]);
+                group.hash_into(hasher);
+            }
+            Type2::ChoiceFromGroupName {
+                name,
+                generic_arguments,
+            } => {
+                hasher.update(&[7]);
+                hash_reference(hasher, name, generic_arguments);
+            }
+            Type2::Tag { tag, ty } => {
+                hasher.update(&[8]);
+                match tag {
+                    None => {
+                        hasher.update(&[0]);
+                    }
+                    Some(tag) => {
+                        hasher.update(&[1]);
+                        tag.hash_into(hasher);
+                    }
+                }
+                ty.hash_into(hasher);
+            }
+            Type2::MajorType { major, argument } => {
+                hasher.update(&[9, *major]);
+                match argument {
+                    None => {
+                        hasher.update(&[0]);
+                    }
+                    Some(argument) => {
+                        hasher.update(&[1]);
+                        argument.hash_into(hasher);
+                    }
+                }
+            }
+            Type2::Any => {
+                hasher.update(&[10]);
+            }
+        }
+    }
+}
+
+impl HeadNumber {
+    /// Writes the number to `hasher`. See [`InterfaceDefinition::hash`].
+    fn hash_into(&self, hasher: &mut blake3::Hasher) {
+        match self {
+            HeadNumber::Literal(number) => {
+                hasher.update(&[0]);
+                hasher.update(&number.to_le_bytes());
+            }
+            HeadNumber::Type(ty) => {
+                hasher.update(&[1]);
+                ty.hash_into(hasher);
+            }
+        }
+    }
+}
+
+impl Group {
+    /// Writes the group to `hasher`, in a way that doesn't depend on the order of the choices.
+    fn hash_into(&self, hasher: &mut blake3::Hasher) {
+        let mut choices = self
+            .choices
+            .iter()
+            .map(|choice| {
+                let mut choice_hasher = blake3::Hasher::new();
+                choice_hasher.update(
+                    &u64::try_from(choice.entries.len())
+                        .unwrap_or_else(|_| unreachable!())
+                        .to_le_bytes(),
+                );
+                for entry in &choice.entries {
+                    entry.hash_into(&mut choice_hasher);
+                }
+                *choice_hasher.finalize().as_bytes()
+            })
+            .collect::<Vec<[u8; 32]>>();
+        choices.sort_unstable();
+        hasher.update(
+            &u64::try_from(choices.len())
+                .unwrap_or_else(|_| unreachable!())
+                .to_le_bytes(),
+        );
+        for choice in &choices {
+            hasher.update(choice);
+        }
+    }
+}
+
+impl GroupEntry {
+    /// Writes the entry to `hasher`. See [`InterfaceDefinition::hash`].
+    fn hash_into(&self, hasher: &mut blake3::Hasher) {
+        match &self.occurrence {
+            None => {
+                hasher.update(&[0]);
+            }
+            Some(Occurrence { min, max: None }) => {
+                hasher.update(&[1]);
+                hasher.update(&min.to_le_bytes());
+            }
+            Some(Occurrence {
+                min,
+                max: Some(max),
+            }) => {
+                hasher.update(&[2]);
+                hasher.update(&min.to_le_bytes());
+                hasher.update(&max.to_le_bytes());
+            }
+        }
+
+        match &self.kind {
+            GroupEntryKind::Member { key, ty } => {
+                hasher.update(&[0]);
+                match key {
+                    None => {
+                        hasher.update(&[0]);
+                    }
+                    Some(MemberKey::Bareword(word)) => {
+                        hasher.update(&[1]);
+                        hasher.update(
+                            &u64::try_from(word.len())
+                                .unwrap_or_else(|_| unreachable!())
+                                .to_le_bytes(),
+                        );
+                        hasher.update(word.as_bytes());
+                    }
+                    Some(MemberKey::Type { ty, cut }) => {
+                        hasher.update(&[2, u8::from(*cut)]);
+                        ty.hash_into(hasher);
+                    }
+                    Some(MemberKey::Value(value)) => {
+                        hasher.update(&[3]);
+                        value.hash_into(hasher);
+                    }
+                }
+                ty.hash_into(hasher);
+            }
+            GroupEntryKind::GroupName {
+                name,
+                generic_arguments,
+            } => {
+                hasher.update(&[1]);
+                hash_reference(hasher, name, generic_arguments);
+            }
+            GroupEntryKind::Inline(group) => {
+                hasher.update(&[2]);
+                group.hash_into(hasher);
+            }
+        }
+    }
+}
+
+impl Value {
+    /// Writes the value to `hasher`. See [`InterfaceDefinition::hash`].
+    fn hash_into(&self, hasher: &mut blake3::Hasher) {
+        match self {
+            Value::Integer(value) => {
+                hasher.update(&[0]);
+                hasher.update(&value.to_le_bytes());
+            }
+            Value::Float(value) => {
+                hasher.update(&[1]);
+                hasher.update(&value.to_bits().to_le_bytes());
+            }
+            Value::Text(text) => {
+                hasher.update(&[2]);
+                hasher.update(
+                    &u64::try_from(text.len())
+                        .unwrap_or_else(|_| unreachable!())
+                        .to_le_bytes(),
+                );
+                hasher.update(text.as_bytes());
+            }
+            Value::Bytes(bytes) => {
+                hasher.update(&[3]);
+                hasher.update(
+                    &u64::try_from(bytes.len())
+                        .unwrap_or_else(|_| unreachable!())
+                        .to_le_bytes(),
+                );
+                hasher.update(bytes);
+            }
+        }
+    }
 }

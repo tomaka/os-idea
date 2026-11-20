@@ -432,3 +432,71 @@ fn syntax_error() {
     // The error is reported at the end of the document, where `]` is missing.
     assert_eq!(err.offset(), 38);
 }
+
+#[test]
+fn hash_ignores_comments_and_whitespace() {
+    let Ok(a) = crate::parse(b"message = [ req, resp ]\nreq = [ tstr ]\nresp = { a: uint }") else {
+        panic!()
+    };
+    let Ok(b) = crate::parse(
+        b"; root\nmessage   =   [req,resp] ; comment\n\n\nreq = [\n  tstr ; text\n]\nresp = {a:uint}\n",
+    ) else {
+        panic!()
+    };
+    assert_eq!(a.hash(), b.hash());
+}
+
+#[test]
+fn hash_aliases() {
+    let Ok(a) = crate::parse(b"message = [ bstr, tstr ] / nil") else {
+        panic!()
+    };
+    let Ok(b) = crate::parse(b"message = [ bytes, text ] / null") else {
+        panic!()
+    };
+    assert_eq!(a.hash(), b.hash());
+}
+
+#[test]
+fn hash_type_choices_unordered() {
+    let Ok(a) = crate::parse(b"message = foo / bar\nfoo = uint / tstr\nbar = nil") else {
+        panic!()
+    };
+    let Ok(b) = crate::parse(b"message = bar / foo\nfoo = tstr / uint\nbar = nil") else {
+        panic!()
+    };
+    assert_eq!(a.hash(), b.hash());
+}
+
+#[test]
+fn hash_group_choices_unordered() {
+    let Ok(a) = crate::parse(b"message = { a: uint // b: tstr, c: nil }") else {
+        panic!()
+    };
+    let Ok(b) = crate::parse(b"message = { b: tstr, c: nil // a: uint }") else {
+        panic!()
+    };
+    assert_eq!(a.hash(), b.hash());
+}
+
+#[test]
+fn hash_structure_changes() {
+    let Ok(base) = crate::parse(
+        b"message = [ req, resp ]\nreq = [ uint, tstr ]\nresp = { a: bytes .size 32 }",
+    ) else {
+        panic!()
+    };
+    for other in [
+        &b"message = [ req, response ]\nreq = [ uint, tstr ]\nresponse = { a: bytes .size 32 }"[..],
+        b"message = [ req, resp ]\nreq = [ tstr, uint ]\nresp = { a: bytes .size 32 }",
+        b"message = [ req, resp ]\nreq = [ uint, tstr ]\nresp = { b: bytes .size 32 }",
+        b"message = [ req, resp ]\nreq = [ uint, tstr ]\nresp = { a: bytes .size 64 }",
+        b"message = [ req, resp ]\nreq = [ uint, tstr ]\nresp = { ? a: bytes .size 32 }",
+        b"message = [ req, resp ]\nresp = { a: bytes .size 32 }\nreq = [ uint, tstr ]",
+    ] {
+        let Ok(other) = crate::parse(other) else {
+            panic!()
+        };
+        assert_ne!(base.hash(), other.hash());
+    }
+}
