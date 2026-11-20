@@ -36,7 +36,9 @@ use quote::quote;
 ///   returns that response.
 /// - A `decode(data)` function on every generated type, that decodes a value of that type from
 ///   its CBOR encoding, and a `DecodeError` type returned when decoding fails. Indefinite-length
-///   CBOR items and tags aren't supported.
+///   CBOR items and tags aren't supported. A `decode_partial(data)` function is also generated,
+///   that decodes a value from the start of `data` and returns it alongside the number of bytes
+///   consumed.
 /// - An `encode_into(self, out)` function on every generated type, that encodes the value to
 ///   CBOR by calling `out` one or more times. The concatenation of all the slices passed to `out`
 ///   forms the encoding.
@@ -1516,12 +1518,28 @@ impl<'d> Generator<'d> {
                 ///
                 /// Returns an error if `data` isn't the encoding of a single valid value.
                 pub fn decode(data: #data_type) -> ::core::result::Result<Self, DecodeError> {
-                    let mut decoder = __impl::Decoder { remaining: data };
-                    let value = Self::decode_from(&mut decoder)?;
-                    if !decoder.remaining.is_empty() {
+                    let (value, consumed) = Self::decode_partial(data)?;
+                    if consumed.get() != data.len() {
                         return Err(DecodeError::TrailingData);
                     }
                     Ok(value)
+                }
+
+                /// Decodes a value from the CBOR encoding found at the start of `data`.
+                ///
+                /// On success, returns the decoded value and the number of bytes of `data` that
+                /// have been consumed. Bytes after these are ignored.
+                pub fn decode_partial(
+                    data: #data_type,
+                ) -> ::core::result::Result<(Self, ::core::num::NonZero<usize>), DecodeError> {
+                    let mut decoder = __impl::Decoder { remaining: data };
+                    let value = Self::decode_from(&mut decoder)?;
+                    let consumed = ::core::num::NonZero::new(data.len() - decoder.remaining.len())
+                        .unwrap_or_else(|| {
+                            // Every CBOR item starts with a head of at least one byte.
+                            unreachable!()
+                        });
+                    Ok((value, consumed))
                 }
 
                 /// Decodes a value from the next CBOR item of `decoder`.

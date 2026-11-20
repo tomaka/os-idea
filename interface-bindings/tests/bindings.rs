@@ -200,6 +200,17 @@ fn decode_multiple_messages() {
         Ok(multiple_messages::ReadResponse(b"data"))
     );
     assert_eq!(
+        multiple_messages::ReadResponse::decode_partial(b"\x44data\x00\x01"),
+        Ok((
+            multiple_messages::ReadResponse(b"data"),
+            core::num::NonZero::new(5).unwrap_or_else(|| unreachable!())
+        ))
+    );
+    assert_eq!(
+        multiple_messages::ReadResponse::decode(b"\x44data\x00"),
+        Err(multiple_messages::DecodeError::TrailingData)
+    );
+    assert_eq!(
         multiple_messages::CloseResponse::decode(b"\xf6"),
         Ok(multiple_messages::CloseResponse(()))
     );
