@@ -275,6 +275,7 @@ dependencies = [
  "allocator-api2 0.4.0",
  "cranelift-codegen",
  "cranelift-frontend",
+ "hashbrown 0.17.1",
  "io-uring",
  "syscalls",
  "target-lexicon",

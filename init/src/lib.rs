@@ -2,6 +2,9 @@ mod vm;
 
 /// Entry point of the init program. Runs the tests and then pauses forever.
 pub fn run(secret_key: [u8; 32]) -> ! {
+    let available_programs =
+        scan_available_programs_unordered().collect::<hashbrown::HashSet<_, fnv::FnvBuildHasher>>();
+
     let secret_key = x25519_dalek::StaticSecret::from(secret_key);
 
     println!("Hello world");
@@ -84,6 +87,45 @@ pub fn run(secret_key: [u8; 32]) -> ! {
     loop {
         std::thread::park();
     }
+}
+
+/// Scans the root directory `/` for files named `<hash>.wasm`, where `<hash>` is the lowercase
+/// hexadecimal representation of 32 bytes, and yields these 32 bytes in no particular order.
+///
+/// Files whose name doesn't match this format are ignored. Errors while reading the directory or
+/// its entries are silently ignored as well.
+pub fn scan_available_programs_unordered() -> impl Iterator<Item = [u8; 32]> {
+    std::fs::read_dir("/")
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let file_name = entry.file_name();
+            let hex = file_name.as_encoded_bytes().strip_suffix(b".wasm")?;
+            if hex.len() != 64 {
+                return None;
+            }
+
+            let mut hash = [0u8; 32];
+            for (byte, digits) in hash.iter_mut().zip(hex.chunks_exact(2)) {
+                for digit in digits {
+                    let nibble = match digit {
+                        b'0'..=b'9' => digit - b'0',
+                        b'a'..=b'f' => digit - b'a' + 10,
+                        _ => return None,
+                    };
+                    *byte = (*byte << 4) | nibble;
+                }
+            }
+
+            // Checked last in order to avoid a system call for unrelated directory entries.
+            // Note that this follows symbolic links.
+            if !entry.path().is_file() {
+                return None;
+            }
+
+            Some(hash)
+        })
 }
 
 /// Runs the `main` function of the given module, answering calls to the `env.add_one` import.
