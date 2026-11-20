@@ -1639,6 +1639,7 @@ dependencies = [
  "fscommon",
  "futures-util",
  "gpt",
+ "interface-bindings",
  "rand",
  "tar",
  "tempfile",

@@ -40,6 +40,8 @@ use quote::quote;
 /// - An `encode_into(self, out)` function on every generated type, that encodes the value to
 ///   CBOR by calling `out` one or more times. The concatenation of all the slices passed to `out`
 ///   forms the encoding.
+/// - A `HASH: [u8; 32]` constant containing the hash of the structure of the interface, as
+///   returned by `interface_parser::InterfaceDefinition::hash`.
 ///
 /// ```ignore
 /// interface_bindings::interface_bindings!("interfaces/executor.cddl");
@@ -154,6 +156,8 @@ fn interface_bindings_common(
         }
     };
 
+    let hash = definition.hash();
+
     quote! {
         pub mod #module_name {
             #![allow(dead_code)]
@@ -164,6 +168,10 @@ fn interface_bindings_common(
 
             // Makes Cargo rebuild the invoking crate whenever the interface definition changes.
             const _: &[u8] = include_bytes!(#path_str);
+
+            /// Hash of the structure of the interface definition, as defined by the
+            /// interface definition hashing rules.
+            pub const HASH: [u8; 32] = [#(#hash),*];
 
             #content
         }

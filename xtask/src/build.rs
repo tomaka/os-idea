@@ -1,6 +1,6 @@
-use std::path::{Path, PathBuf};
-
 use crate::{build_init, build_kernel};
+use core::iter;
+use std::path::{Path, PathBuf};
 
 /// Outcome of [`build`].
 pub struct BuildOutput {
@@ -11,6 +11,8 @@ pub struct BuildOutput {
     /// List of Wasm programs to include at the root.
     pub wasm_programs: Vec<([u8; 32], PathBuf)>,
 }
+
+interface_bindings::interface_bindings_definitions_only!("../interfaces/executor.cddl");
 
 /// Builds the kernel and the init ramdisk.
 ///
@@ -23,9 +25,17 @@ pub fn build(project_root: &Path) -> BuildOutput {
 
     let bzimage = build_kernel::build_kernel(project_root).unwrap();
 
+    let messages = iter::once(executor::StartRequest(
+        [0; 32],
+        executor::Interfaces(Default::default()),
+    ));
+
     let init = build_init::build_init(build_init::Config {
         secret_key: *init_secret_key.as_bytes(),
-        initial_executor_messages: Vec::new(), // TODO:
+        initial_executor_messages: messages.fold(Vec::new(), |mut out_buffer, message| {
+            message.encode_into(|slice| out_buffer.extend_from_slice(slice));
+            out_buffer
+        }),
     });
 
     BuildOutput {
