@@ -1,0 +1,19 @@
+message = [ values-request, values-response ]
+
+values-request = [
+    float,
+    float32,
+    bool,
+    true,
+    nint,
+    int,
+    -5..5,
+    ? uint,
+    * tstr,
+]
+
+values-response = uint / tstr / [ 2*3 bool ]
+
+; These names used to collide with the generated implementation details.
+decoder = uint
+encoder = [ decoder ]
