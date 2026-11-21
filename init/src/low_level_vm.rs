@@ -754,42 +754,113 @@ impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
             .max(1);
 
         let isa = build_isa()?;
-        let mut linker = Linker::default();
         let mut ctx = Context::new();
         let mut builder_ctx = FunctionBuilderContext::new();
 
-        // Compile all the Wasm functions. Bodies are those of the non-imported functions.
-        for (body_idx, body) in bodies.iter().enumerate() {
-            let func_idx = imports.len() + body_idx;
-            ctx.clear();
-            ctx.func.signature = funcs[func_idx].to_clif();
-            ctx.func.name = UserFuncName::user(NAMESPACE_WASM_FUNC, func_idx as u32);
-            let builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
-            let mut translator =
-                Translator::new(builder, &types, &funcs, imports.len(), &globals, func_idx);
-            translator.translate(body)?;
-            translator.builder.finalize(isa.frontend_config());
-            linker.add(&isa, &mut ctx, NAMESPACE_WASM_FUNC, func_idx as u32)?;
-        }
+        // Machine code of all the compiled functions, concatenated.
+        let mut code = Vec::<u8>::new();
+        // (namespace, index) => offset in `code`.
+        let mut offsets = BTreeMap::<(u32, u32), usize>::new();
+        // (offset in `code`, kind, target, addend)
+        let mut relocs = Vec::<(usize, Reloc, (u32, u32), i64)>::new();
+        // Offset in `code` of each trapping instruction => trap code.
+        let mut traps = BTreeMap::<usize, TrapCode>::new();
 
-        // Compile one trampoline per exported function.
-        for (export_idx, (_, func_idx)) in exports.iter().enumerate() {
-            if (*func_idx as usize) < imports.len() {
-                return Err(Error::Unsupported("re-exported import"));
+        // Compile all the Wasm functions, followed with one trampoline per exported function.
+        // Bodies are those of the non-imported functions.
+        for item_idx in 0..(bodies.len() + exports.len()) {
+            ctx.clear();
+            let (namespace, index) = if let Some(body) = bodies.get(item_idx) {
+                let func_idx = imports.len() + item_idx;
+                ctx.func.signature = funcs[func_idx].to_clif();
+                let builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+                let mut translator =
+                    Translator::new(builder, &types, &funcs, imports.len(), &globals, func_idx);
+                translator.translate(body)?;
+                translator.builder.finalize(isa.frontend_config());
+                (NAMESPACE_WASM_FUNC, func_idx as u32)
+            } else {
+                let export_idx = item_idx - bodies.len();
+                let func_idx = exports[export_idx].1;
+                if (func_idx as usize) < imports.len() {
+                    return Err(Error::Unsupported("re-exported import"));
+                }
+                build_trampoline(
+                    &mut ctx.func,
+                    &mut builder_ctx,
+                    &funcs[func_idx as usize],
+                    func_idx,
+                    isa.frontend_config(),
+                );
+                (NAMESPACE_TRAMPOLINE, export_idx as u32)
+            };
+            ctx.func.name = UserFuncName::user(namespace, index);
+
+            let compiled = ctx
+                .compile(&*isa, &mut ControlPlane::default())
+                .map_err(|_| Error::Compile)?;
+
+            while code.len() % 16 != 0 {
+                code.push(0xcc); // int3
             }
-            ctx.clear();
-            build_trampoline(
-                &mut ctx.func,
-                &mut builder_ctx,
-                &funcs[*func_idx as usize],
-                *func_idx,
-                isa.frontend_config(),
-            );
-            ctx.func.name = UserFuncName::user(NAMESPACE_TRAMPOLINE, export_idx as u32);
-            linker.add(&isa, &mut ctx, NAMESPACE_TRAMPOLINE, export_idx as u32)?;
+            let base = code.len();
+            code.extend_from_slice(compiled.code_buffer());
+            offsets.insert((namespace, index), base);
+            let compiled_relocs = compiled.buffer.relocs().to_vec();
+            for trap in compiled.buffer.traps() {
+                traps.insert(base + trap.offset as usize, trap.code);
+            }
+
+            for reloc in compiled_relocs {
+                let target = match &reloc.target {
+                    FinalizedRelocTarget::ExternalName(ExternalName::User(name)) => {
+                        let name = &ctx.func.params.user_named_funcs()[*name];
+                        (name.namespace, name.index)
+                    }
+                    _ => return Err(Error::Unsupported("relocation target")),
+                };
+                relocs.push((
+                    base + reloc.offset as usize,
+                    reloc.kind,
+                    target,
+                    reloc.addend,
+                ));
+            }
         }
 
-        let (code, code_layout, offsets, traps) = linker.link(&code_allocator)?;
+        // Copy the code to executable memory and resolve the relocations.
+        // Functions are aligned on 16 bytes relative to the start of the code.
+        let code_layout =
+            Layout::from_size_align(code.len().max(1), 16).map_err(|_| Error::Allocation)?;
+        let code_mem = code_allocator
+            .allocate(code_layout)
+            .map_err(|_| Error::Allocation)?
+            .cast::<u8>();
+        let code_base = code_mem.as_ptr() as usize;
+        unsafe {
+            ptr::copy_nonoverlapping(code.as_ptr(), code_mem.as_ptr(), code.len());
+        }
+
+        for (offset, kind, target, addend) in relocs {
+            let target_addr = if target == (NAMESPACE_HOST, 0) {
+                (init_vm_yield as *const ()).addr() as i64 + addend
+            } else if target == (NAMESPACE_HOST, 1) {
+                (init_vm_call_import as *const ()).addr() as i64 + addend
+            } else {
+                (code_base + offsets[&target]) as i64 + addend
+            };
+            let at = unsafe { code_mem.as_ptr().add(offset) };
+            match kind {
+                Reloc::X86CallPCRel4 | Reloc::X86PCRel4 => {
+                    let delta = target_addr - (code_base + offset) as i64;
+                    let delta = i32::try_from(delta).map_err(|_| Error::Compile)?;
+                    unsafe { ptr::write_unaligned(at as *mut i32, delta) };
+                }
+                Reloc::Abs8 => unsafe { ptr::write_unaligned(at as *mut i64, target_addr) },
+                _ => return Err(Error::Unsupported("relocation kind")),
+            }
+        }
+
         let exports = exports
             .into_iter()
             .enumerate()
@@ -800,7 +871,7 @@ impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
             .collect();
 
         Ok(Module {
-            code,
+            code: code_mem,
             code_layout,
             code_allocator,
             funcs,
@@ -910,114 +981,6 @@ fn import_wasm_func(builder: &mut FunctionBuilder, sig: &FuncSig, func_idx: u32)
         colocated: true,
         patchable: false,
     })
-}
-
-/// Accumulates compiled functions, then copies them to executable memory and resolves the
-/// relocations between them.
-#[derive(Default)]
-struct Linker {
-    code: Vec<u8>,
-    /// (namespace, index) => offset in `code`.
-    offsets: BTreeMap<(u32, u32), usize>,
-    /// (offset in `code`, kind, target, addend)
-    relocs: Vec<(usize, Reloc, (u32, u32), i64)>,
-    /// Offset in `code` of each trapping instruction => trap code.
-    traps: BTreeMap<usize, TrapCode>,
-}
-
-impl Linker {
-    fn add(
-        &mut self,
-        isa: &OwnedTargetIsa,
-        ctx: &mut Context,
-        namespace: u32,
-        index: u32,
-    ) -> Result<(), Error> {
-        let compiled = ctx
-            .compile(&**isa, &mut ControlPlane::default())
-            .map_err(|_| Error::Compile)?;
-
-        while self.code.len() % 16 != 0 {
-            self.code.push(0xcc); // int3
-        }
-        let base = self.code.len();
-        self.code.extend_from_slice(compiled.code_buffer());
-        self.offsets.insert((namespace, index), base);
-        let relocs = compiled.buffer.relocs().to_vec();
-        for trap in compiled.buffer.traps() {
-            self.traps.insert(base + trap.offset as usize, trap.code);
-        }
-
-        for reloc in relocs {
-            let target = match &reloc.target {
-                FinalizedRelocTarget::ExternalName(ExternalName::User(name)) => {
-                    let name = &ctx.func.params.user_named_funcs()[*name];
-                    (name.namespace, name.index)
-                }
-                _ => return Err(Error::Unsupported("relocation target")),
-            };
-            self.relocs.push((
-                base + reloc.offset as usize,
-                reloc.kind,
-                target,
-                reloc.addend,
-            ));
-        }
-
-        Ok(())
-    }
-
-    /// Copies the code to memory allocated with `allocator`, and resolves the relocations.
-    ///
-    /// Returns the allocated memory and its layout, the offset of each function, and the
-    /// offset of each trapping instruction.
-    #[allow(clippy::type_complexity)]
-    fn link(
-        self,
-        allocator: &impl Allocator,
-    ) -> Result<
-        (
-            NonNull<u8>,
-            Layout,
-            BTreeMap<(u32, u32), usize>,
-            BTreeMap<usize, TrapCode>,
-        ),
-        Error,
-    > {
-        // Functions are aligned on 16 bytes relative to the start of the code.
-        let layout =
-            Layout::from_size_align(self.code.len().max(1), 16).map_err(|_| Error::Allocation)?;
-        let mem = allocator
-            .allocate(layout)
-            .map_err(|_| Error::Allocation)?
-            .cast::<u8>();
-        let base = mem.as_ptr() as usize;
-        unsafe {
-            ptr::copy_nonoverlapping(self.code.as_ptr(), mem.as_ptr(), self.code.len());
-        }
-
-        for (offset, kind, target, addend) in self.relocs {
-            let target_addr = if target == (NAMESPACE_HOST, 0) {
-                (init_vm_yield as *const ()).addr() as i64 + addend
-            } else if target == (NAMESPACE_HOST, 1) {
-                (init_vm_call_import as *const ()).addr() as i64 + addend
-            } else {
-                (base + self.offsets[&target]) as i64 + addend
-            };
-            let at = unsafe { mem.as_ptr().add(offset) };
-            match kind {
-                Reloc::X86CallPCRel4 | Reloc::X86PCRel4 => {
-                    let delta = target_addr - (base + offset) as i64;
-                    let delta = i32::try_from(delta).map_err(|_| Error::Compile)?;
-                    unsafe { ptr::write_unaligned(at as *mut i32, delta) };
-                }
-                Reloc::Abs8 => unsafe { ptr::write_unaligned(at as *mut i64, target_addr) },
-                _ => return Err(Error::Unsupported("relocation kind")),
-            }
-        }
-
-        Ok((mem, layout, self.offsets, self.traps))
-    }
 }
 
 /// Proof that the signal handlers that catch traps have been installed.
