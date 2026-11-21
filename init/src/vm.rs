@@ -527,6 +527,27 @@ impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
     /// passed by the Wasm code. See [`Outcome`].
     ///
     /// Only imported functions with exactly one parameter and one result are supported.
+    ///
+    /// # Constraints on the callback
+    ///
+    /// The callback is called directly by the compiled Wasm code, from within
+    /// [`Instance::call`] or [`Instance::resume`] and on the same thread, but on the native stack
+    /// of the [`Instance`] rather than on the stack of the host. As a consequence:
+    ///
+    /// - The callback shares the 1 MiB native stack of the instance with the Wasm code that is
+    ///   currently executing. It should avoid deep recursion and large stack allocations. There
+    ///   is currently no guard page below that stack, so a stack overflow in the callback
+    ///   silently corrupts the memory below it instead of crashing.
+    /// - A panic in the callback aborts the entire process, because unwinding through the frames
+    ///   of the Wasm code isn't possible.
+    /// - A fault in the callback (for example a segmentation fault) isn't reported as a Wasm
+    ///   trap, and kills the process with the default action of the signal.
+    /// - If the callback blocks, the execution of the Wasm code and the thread are blocked as
+    ///   well. Use [`Outcome::Park`] to give control back to the host instead.
+    ///
+    /// The value passed to [`Outcome::Resume`] must have the type of the result of the import.
+    /// Otherwise, the execution is abandoned and [`Instance::call`] or [`Instance::resume`]
+    /// returns [`Error::BadArgs`].
     #[inline]
     pub fn register_import(&mut self, callback: fn(ParamsAccess<'_>) -> Outcome) {
         self.import_callbacks.push(callback);
