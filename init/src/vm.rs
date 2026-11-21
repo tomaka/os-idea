@@ -25,12 +25,24 @@
 //! - The Wasm code calls an imported function. The host gets an [`Outcome::ImportCall`] and
 //!   can later continue the execution with [`Instance::resume`].
 //! - The Wasm code traps. Cranelift compiles traps into `ud2` instructions or relies on the
-//!   CPU raising an exception, and stack overflows hit a guard page. The resulting `SIGILL`,
-//!   `SIGFPE` or `SIGSEGV` is caught by a signal handler (see [`install_trap_handlers`]) that
-//!   redirects the execution to a routine that abandons the Wasm stack and jumps back to the
-//!   host stack.
+//!   CPU raising an exception. The resulting `SIGILL`, `SIGFPE` or `SIGSEGV` is caught by a
+//!   signal handler (see [`install_trap_handlers`]) that redirects the execution to a routine
+//!   that abandons the Wasm stack and jumps back to the host stack.
+//!
+//! The memory of the compiled code and of the native stacks is obtained from implementations
+//! of [`Allocator`] passed by the user.
+//!
+//! TODO: restore guard pages below the native stacks, in order to reliably detect stack
+//! overflows. Right now, a stack overflow overwrites whatever memory is below the stack.
 
-use core::{arch::global_asm, cell::Cell, fmt, mem::offset_of, ptr};
+use core::{
+    alloc::{Allocator, Layout},
+    arch::global_asm,
+    cell::Cell,
+    fmt,
+    mem::offset_of,
+    ptr::{self, NonNull},
+};
 use std::collections::BTreeMap;
 
 use cranelift_codegen::{
@@ -59,10 +71,13 @@ const NAMESPACE_TRAMPOLINE: u32 = 1;
 /// routine is `init_vm_yield`, at index 0.
 const NAMESPACE_HOST: u32 = 2;
 
-/// Size in bytes of the usable part of the native stack of each instance.
-const STACK_SIZE: usize = 1024 * 1024;
-/// Size in bytes of the inaccessible region below the native stack of each instance.
-const STACK_GUARD_SIZE: usize = 64 * 1024;
+/// Layout of the native stack of each instance.
+const STACK_LAYOUT: Layout = match Layout::from_size_align(1024 * 1024, 16) {
+    Ok(layout) => layout,
+    Err(_) => panic!(),
+};
+/// Size in bytes of the alternate signal stack, if one has to be allocated.
+const SIGNAL_STACK_SIZE: usize = 64 * 1024;
 
 /// Value returned by `init_vm_switch` on the host side when the Wasm function has returned.
 const OUTCOME_FINISHED: u64 = 0;
@@ -186,8 +201,8 @@ pub enum Error {
     Unsupported(&'static str),
     /// Cranelift failed to compile a function.
     Compile,
-    /// Failed to allocate executable memory.
-    Mmap,
+    /// Failed to allocate memory.
+    Allocation,
     /// The requested export doesn't exist or isn't a function.
     NoSuchExport,
     /// The parameters passed to [`Instance::call`] or [`Instance::resume`] don't match the
@@ -242,7 +257,7 @@ impl fmt::Display for Error {
             Error::Parse(err) => write!(f, "invalid Wasm: {err}"),
             Error::Unsupported(what) => write!(f, "unsupported Wasm feature: {what}"),
             Error::Compile => write!(f, "compilation failed"),
-            Error::Mmap => write!(f, "failed to allocate executable memory"),
+            Error::Allocation => write!(f, "failed to allocate memory"),
             Error::NoSuchExport => write!(f, "no such exported function"),
             Error::BadArgs => write!(f, "arguments don't match the function signature"),
             Error::NotSuspended => write!(f, "no execution is suspended"),
@@ -275,9 +290,6 @@ struct VmCtx {
     /// Range of addresses of the compiled code of the module.
     code_start: u64,
     code_end: u64,
-    /// Range of addresses of the guard region of the Wasm stack.
-    guard_start: u64,
-    guard_end: u64,
 }
 
 /// Signature of a Wasm function, restricted to the supported types.
@@ -328,8 +340,13 @@ fn eval_const_expr(expr: &wasmparser::ConstExpr) -> Result<Value, Error> {
 }
 
 /// A compiled Wasm module.
-pub struct Module {
-    code: Mmap,
+///
+/// The compiled code is stored in memory allocated by `TCodeAlloc`, which must be executable.
+pub struct Module<TCodeAlloc: Allocator> {
+    /// Compiled code, allocated with `code_allocator` and `code_layout`.
+    code: NonNull<u8>,
+    code_layout: Layout,
+    code_allocator: TCodeAlloc,
     /// Signature of each function, imported functions first.
     funcs: Vec<FuncSig>,
     /// Imported functions: (module name, field name).
@@ -347,9 +364,12 @@ pub struct Module {
     values_len: usize,
 }
 
-impl Module {
+impl<TCodeAlloc: Allocator> Module<TCodeAlloc> {
     /// Parses, validates and compiles the given Wasm module.
-    pub fn new(wasm: &[u8]) -> Result<Self, Error> {
+    ///
+    /// The compiled code is written to memory allocated with `code_allocator`. This memory must
+    /// be executable.
+    pub fn new(wasm: &[u8], code_allocator: TCodeAlloc) -> Result<Self, Error> {
         wasmparser::Validator::new().validate_all(wasm)?;
 
         let mut types = Vec::new();
@@ -485,7 +505,7 @@ impl Module {
             linker.add(&isa, &mut ctx, NAMESPACE_TRAMPOLINE, export_idx as u32)?;
         }
 
-        let (code, offsets, traps) = linker.link()?;
+        let (code, code_layout, offsets, traps) = linker.link(&code_allocator)?;
         let exports = exports
             .into_iter()
             .enumerate()
@@ -497,6 +517,8 @@ impl Module {
 
         Ok(Module {
             code,
+            code_layout,
+            code_allocator,
             funcs,
             imports,
             exports,
@@ -515,11 +537,19 @@ impl Module {
     }
 }
 
+impl<TCodeAlloc: Allocator> Drop for Module<TCodeAlloc> {
+    fn drop(&mut self) {
+        // SAFETY: `code` was allocated with `code_allocator` and `code_layout`.
+        unsafe { self.code_allocator.deallocate(self.code, self.code_layout) };
+    }
+}
+
 fn build_isa() -> Result<OwnedTargetIsa, Error> {
     let mut flags = settings::builder();
     flags.set("opt_level", "speed").map_err(|_| Error::Compile)?;
     flags.set("is_pic", "false").map_err(|_| Error::Compile)?;
     // Makes sure that functions with a large stack frame can't skip over the guard region.
+    // TODO: there is no guard region at the moment, see the module-level documentation
     flags
         .set("enable_probestack", "true")
         .map_err(|_| Error::Compile)?;
@@ -643,14 +673,33 @@ impl Linker {
         Ok(())
     }
 
+    /// Copies the code to memory allocated with `allocator`, and resolves the relocations.
+    ///
+    /// Returns the allocated memory and its layout, the offset of each function, and the
+    /// offset of each trapping instruction.
     #[allow(clippy::type_complexity)]
     fn link(
         self,
-    ) -> Result<(Mmap, BTreeMap<(u32, u32), usize>, BTreeMap<usize, TrapCode>), Error> {
-        let mut mem = Mmap::new(self.code.len().max(1))?;
-        let base = mem.ptr as usize;
+        allocator: &impl Allocator,
+    ) -> Result<
+        (
+            NonNull<u8>,
+            Layout,
+            BTreeMap<(u32, u32), usize>,
+            BTreeMap<usize, TrapCode>,
+        ),
+        Error,
+    > {
+        // Functions are aligned on 16 bytes relative to the start of the code.
+        let layout =
+            Layout::from_size_align(self.code.len().max(1), 16).map_err(|_| Error::Allocation)?;
+        let mem = allocator
+            .allocate(layout)
+            .map_err(|_| Error::Allocation)?
+            .cast::<u8>();
+        let base = mem.as_ptr() as usize;
         unsafe {
-            ptr::copy_nonoverlapping(self.code.as_ptr(), mem.ptr, self.code.len());
+            ptr::copy_nonoverlapping(self.code.as_ptr(), mem.as_ptr(), self.code.len());
         }
 
         for (offset, kind, target, addend) in self.relocs {
@@ -659,7 +708,7 @@ impl Linker {
             } else {
                 (base + self.offsets[&target]) as i64 + addend
             };
-            let at = unsafe { mem.ptr.add(offset) };
+            let at = unsafe { mem.as_ptr().add(offset) };
             match kind {
                 Reloc::X86CallPCRel4 | Reloc::X86PCRel4 => {
                     let delta = target_addr - (base + offset) as i64;
@@ -671,66 +720,7 @@ impl Linker {
             }
         }
 
-        mem.protect(0, mem.len, Mmap::PROT_READ | Mmap::PROT_EXEC)?;
-        Ok((mem, self.offsets, self.traps))
-    }
-}
-
-/// Memory region obtained through `mmap`.
-struct Mmap {
-    ptr: *mut u8,
-    len: usize,
-}
-
-impl Mmap {
-    const PROT_NONE: usize = 0x0;
-    const PROT_READ: usize = 0x1;
-    const PROT_WRITE: usize = 0x2;
-    const PROT_EXEC: usize = 0x4;
-    const MAP_PRIVATE: usize = 0x02;
-    const MAP_ANONYMOUS: usize = 0x20;
-
-    /// Allocates a readable and writable region of the given length.
-    fn new(len: usize) -> Result<Self, Error> {
-        let ptr = unsafe {
-            syscalls::syscall!(
-                syscalls::Sysno::mmap,
-                0usize,
-                len,
-                Self::PROT_READ | Self::PROT_WRITE,
-                Self::MAP_PRIVATE | Self::MAP_ANONYMOUS,
-                usize::MAX, // fd = -1
-                0usize
-            )
-        }
-        .map_err(|_| Error::Mmap)?;
-        Ok(Mmap {
-            ptr: ptr as *mut u8,
-            len,
-        })
-    }
-
-    /// Changes the protection of the given page-aligned range of the region.
-    fn protect(&mut self, offset: usize, len: usize, prot: usize) -> Result<(), Error> {
-        assert!(offset + len <= self.len);
-        unsafe {
-            syscalls::syscall!(
-                syscalls::Sysno::mprotect,
-                self.ptr as usize + offset,
-                len,
-                prot
-            )
-        }
-        .map_err(|_| Error::Mmap)?;
-        Ok(())
-    }
-}
-
-impl Drop for Mmap {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = syscalls::syscall!(syscalls::Sysno::munmap, self.ptr as usize, self.len);
-        }
+        Ok((mem, layout, self.offsets, self.traps))
     }
 }
 
@@ -799,11 +789,13 @@ pub unsafe fn install_trap_handlers() -> Result<TrapHandlers, Error> {
     .map_err(|_| Error::SignalHandlers)?;
     // `SS_DISABLE` is 2.
     if current_stack.flags & 2 != 0 {
-        let stack = Mmap::new(STACK_GUARD_SIZE)?;
+        // The alternate stack must remain valid for as long as the thread exists, hence why
+        // it is leaked.
+        let stack = Box::leak(vec![0u8; SIGNAL_STACK_SIZE].into_boxed_slice());
         let new_stack = KernelStack {
-            sp: stack.ptr as usize,
+            sp: stack.as_mut_ptr() as usize,
             flags: 0,
-            size: stack.len,
+            size: stack.len(),
         };
         unsafe {
             syscalls::syscall!(
@@ -813,8 +805,6 @@ pub unsafe fn install_trap_handlers() -> Result<TrapHandlers, Error> {
             )
         }
         .map_err(|_| Error::SignalHandlers)?;
-        // The alternate stack must remain valid for as long as the thread exists.
-        core::mem::forget(stack);
     }
 
     let action = KernelSigaction {
@@ -862,21 +852,15 @@ unsafe extern "C" fn trap_signal_handler(signal: u32, info: *mut u8, context: *m
         let fault_addr = info.add(SI_ADDR_OFFSET).cast::<u64>().read_unaligned();
 
         let vmctx = CURRENT_VMCTX.get();
-        if !vmctx.is_null() {
-            let in_code = pc >= (*vmctx).code_start && pc < (*vmctx).code_end;
-            let in_guard = signal == KernelSigaction::SIGSEGV
-                && fault_addr >= (*vmctx).guard_start
-                && fault_addr < (*vmctx).guard_end;
-            if in_code || in_guard {
-                (*vmctx).trap_signal = signal;
-                (*vmctx).trap_pc = pc;
-                (*vmctx).trap_addr = fault_addr;
-                gregs
-                    .add(REG_RIP)
-                    .write_unaligned((init_vm_trap_landing as *const ()).addr() as u64);
-                gregs.add(REG_RDI).write_unaligned(vmctx as u64);
-                return;
-            }
+        if !vmctx.is_null() && pc >= (*vmctx).code_start && pc < (*vmctx).code_end {
+            (*vmctx).trap_signal = signal;
+            (*vmctx).trap_pc = pc;
+            (*vmctx).trap_addr = fault_addr;
+            gregs
+                .add(REG_RIP)
+                .write_unaligned((init_vm_trap_landing as *const ()).addr() as u64);
+            gregs.add(REG_RDI).write_unaligned(vmctx as u64);
+            return;
         }
 
         // Not a Wasm trap. Restore the default action. The faulting instruction is executed
@@ -898,15 +882,18 @@ unsafe extern "C" fn trap_signal_handler(signal: u32, info: *mut u8, context: *m
 }
 
 /// An instantiated module, with its own memory, globals, and native stack.
-pub struct Instance<'m> {
-    module: &'m Module,
+///
+/// The native stack is allocated with `TStackAlloc`.
+pub struct Instance<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator> {
+    module: &'m Module<TCodeAlloc>,
     /// Obtained from `Box::into_raw`. Accessed by the compiled code, hence why it is a raw
     /// pointer.
     vmctx: *mut VmCtx,
     state: InstanceState,
-    /// Native stack on which the Wasm code runs. The first `STACK_GUARD_SIZE` bytes are
-    /// inaccessible.
-    stack: Mmap,
+    /// Native stack on which the Wasm code runs, allocated with `stack_allocator` and
+    /// [`STACK_LAYOUT`].
+    stack: NonNull<u8>,
+    stack_allocator: TStackAlloc,
     // These fields are accessed through raw pointers in `vmctx`.
     _memory: Vec<u8>,
     _globals: Vec<u64>,
@@ -920,10 +907,15 @@ enum InstanceState {
     Suspended { export_func: u32, import: u32 },
 }
 
-impl<'m> Instance<'m> {
-    pub fn new(module: &'m Module, _trap_handlers: &TrapHandlers) -> Result<Self, Error> {
+impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator> Instance<'m, TCodeAlloc, TStackAlloc> {
+    /// Instantiates the given module. Its native stack is allocated with `stack_allocator`.
+    pub fn new(
+        module: &'m Module<TCodeAlloc>,
+        _trap_handlers: &TrapHandlers,
+        stack_allocator: TStackAlloc,
+    ) -> Result<Self, Error> {
         let mem_len = module.memory_pages.unwrap_or(0) * WASM_PAGE_SIZE;
-        let mut memory = vec![0u8; usize::try_from(mem_len).map_err(|_| Error::Mmap)?];
+        let mut memory = vec![0u8; usize::try_from(mem_len).map_err(|_| Error::Allocation)?];
         for (offset, bytes) in &module.data {
             // Bounds were already checked by the validator only if the memory is large enough;
             // check again to be safe.
@@ -945,11 +937,13 @@ impl<'m> Instance<'m> {
 
         let mut values = vec![0u64; module.values_len];
 
-        let mut stack = Mmap::new(STACK_GUARD_SIZE + STACK_SIZE)?;
-        stack.protect(0, STACK_GUARD_SIZE, Mmap::PROT_NONE)?;
+        // TODO: restore a guard region below the stack
+        let stack = stack_allocator
+            .allocate(STACK_LAYOUT)
+            .map_err(|_| Error::Allocation)?
+            .cast::<u8>();
 
-        let code_start = module.code.ptr as u64;
-        let guard_start = stack.ptr as u64;
+        let code_start = module.code.as_ptr() as u64;
         let vmctx = Box::into_raw(Box::new(VmCtx {
             mem_base: memory.as_mut_ptr(),
             mem_len,
@@ -962,9 +956,7 @@ impl<'m> Instance<'m> {
             host_rsp: 0,
             wasm_rsp: 0,
             code_start,
-            code_end: code_start + module.code.len as u64,
-            guard_start,
-            guard_end: guard_start + STACK_GUARD_SIZE as u64,
+            code_end: code_start + module.code_layout.size() as u64,
         }));
 
         Ok(Instance {
@@ -972,6 +964,7 @@ impl<'m> Instance<'m> {
             vmctx,
             state: InstanceState::Idle,
             stack,
+            stack_allocator,
             _memory: memory,
             _globals: globals,
             _values: values,
@@ -989,10 +982,10 @@ impl<'m> Instance<'m> {
 
         // Prepare the Wasm stack so that `init_vm_switch` "returns" into `init_vm_fiber_start`
         // with the expected registers, and with a stack pointer aligned on 16 bytes.
-        let stack_top = self.stack.ptr as u64 + self.stack.len as u64;
+        let stack_top = self.stack.as_ptr() as u64 + STACK_LAYOUT.size() as u64;
         let frame: [u64; 9] = [
             0,                                      // r15
-            module.code.ptr as u64 + offset as u64, // r14: trampoline
+            module.code.as_ptr() as u64 + offset as u64, // r14: trampoline
             unsafe { (*self.vmctx).values } as u64, // r13
             self.vmctx as u64,                      // r12
             0,                                      // rbx
@@ -1056,24 +1049,18 @@ impl<'m> Instance<'m> {
             }
             OUTCOME_TRAP => {
                 self.state = InstanceState::Idle;
-                let (signal, pc, fault_addr) =
-                    unsafe { ((*vmctx).trap_signal, (*vmctx).trap_pc, (*vmctx).trap_addr) };
-                let in_guard = unsafe {
-                    fault_addr >= (*vmctx).guard_start && fault_addr < (*vmctx).guard_end
-                };
-                let trap = if signal == KernelSigaction::SIGSEGV && in_guard {
-                    Trap::StackOverflow
-                } else {
-                    let code_offset = usize::try_from(pc - module.code.ptr as u64)
-                        .unwrap_or_else(|_| unreachable!());
-                    match module.traps.get(&code_offset) {
-                        Some(&TrapCode::HEAP_OUT_OF_BOUNDS) => Trap::OutOfBounds,
-                        Some(&TrapCode::INTEGER_DIVISION_BY_ZERO) => Trap::DivisionByZero,
-                        Some(&TrapCode::INTEGER_OVERFLOW) => Trap::IntegerOverflow,
-                        Some(&TrapCode::STACK_OVERFLOW) => Trap::StackOverflow,
-                        Some(code) if Some(*code) == TrapCode::user(1) => Trap::Unreachable,
-                        _ => Trap::Unknown,
-                    }
+                let pc = unsafe { (*vmctx).trap_pc };
+                // TODO: when guard pages are restored, report `Trap::StackOverflow` if
+                // `fault_addr` is in the guard region of the stack
+                let code_offset = usize::try_from(pc - module.code.as_ptr() as u64)
+                    .unwrap_or_else(|_| unreachable!());
+                let trap = match module.traps.get(&code_offset) {
+                    Some(&TrapCode::HEAP_OUT_OF_BOUNDS) => Trap::OutOfBounds,
+                    Some(&TrapCode::INTEGER_DIVISION_BY_ZERO) => Trap::DivisionByZero,
+                    Some(&TrapCode::INTEGER_OVERFLOW) => Trap::IntegerOverflow,
+                    Some(&TrapCode::STACK_OVERFLOW) => Trap::StackOverflow,
+                    Some(code) if Some(*code) == TrapCode::user(1) => Trap::Unreachable,
+                    _ => Trap::Unknown,
                 };
                 Err(Error::Trap(trap))
             }
@@ -1117,11 +1104,15 @@ impl<'m> Instance<'m> {
     }
 }
 
-impl Drop for Instance<'_> {
+impl<TCodeAlloc: Allocator, TStackAlloc: Allocator> Drop
+    for Instance<'_, TCodeAlloc, TStackAlloc>
+{
     fn drop(&mut self) {
         // The Wasm stack contains no Rust frames, so a suspended execution can simply be
         // discarded.
         unsafe { drop(Box::from_raw(self.vmctx)) };
+        // SAFETY: `stack` was allocated with `stack_allocator` and `STACK_LAYOUT`.
+        unsafe { self.stack_allocator.deallocate(self.stack, STACK_LAYOUT) };
     }
 }
 

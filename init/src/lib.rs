@@ -1,4 +1,5 @@
 mod executor;
+mod mmap_alloc;
 mod vm;
 
 /// Configuration passed to [`run`].
@@ -73,8 +74,11 @@ pub fn run(config: Config) -> ! {
             }
 
             // Check that an instance remains usable after a trap.
-            let reuse_result = vm::Module::new(TEST_REUSE_WASM).and_then(|module| {
-                let mut instance = vm::Instance::new(&module, &trap_handlers)?;
+            let reuse_result =
+                vm::Module::new(TEST_REUSE_WASM, mmap_alloc::Mmap::read_write_exec());
+            let reuse_result = reuse_result.and_then(|module| {
+                let mut instance =
+                    vm::Instance::new(&module, &trap_handlers, mmap_alloc::Mmap::read_write())?;
                 let first = instance.call("incr", &[]);
                 let trap = instance.call("trap", &[]);
                 let second = instance.call("incr", &[]);
@@ -144,8 +148,8 @@ fn run_wasm(
     trap_handlers: &vm::TrapHandlers,
     wasm_bytes: &[u8],
 ) -> Result<Vec<vm::Value>, vm::Error> {
-    let module = vm::Module::new(wasm_bytes)?;
-    let mut instance = vm::Instance::new(&module, trap_handlers)?;
+    let module = vm::Module::new(wasm_bytes, mmap_alloc::Mmap::read_write_exec())?;
+    let mut instance = vm::Instance::new(&module, trap_handlers, mmap_alloc::Mmap::read_write())?;
     let mut outcome = instance.call("main", &[])?;
     loop {
         match outcome {
