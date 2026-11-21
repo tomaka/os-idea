@@ -229,7 +229,7 @@ unsafe extern "sysv64" fn init_vm_call_import<TCtxt>(
         };
         let callbacks = (*vmctx)
             .import_callbacks
-            .cast::<fn(&mut TCtxt, ParamsAccess<'_>) -> Outcome>();
+            .cast::<Box<dyn Fn(&mut TCtxt, ParamsAccess<'_>) -> Outcome>>();
         // The host can't access the context while the Wasm code runs, as `Instance::call` and
         // `Instance::resume` take `&mut self`.
         let ctxt = &mut *(*vmctx).ctxt.cast::<TCtxt>();
@@ -577,7 +577,7 @@ pub struct Module<TCodeAlloc: Allocator, TCtxt> {
     /// Imported functions: (module name, field name).
     imports: Vec<(String, String)>,
     /// Callback of each imported function, in the same order as `imports`.
-    import_callbacks: Vec<fn(&mut TCtxt, ParamsAccess<'_>) -> Outcome>,
+    import_callbacks: Vec<Box<dyn Fn(&mut TCtxt, ParamsAccess<'_>) -> Outcome>>,
     /// Exported functions: name => (function index, offset of the trampoline in `code`).
     exports: BTreeMap<String, (u32, usize)>,
     /// Minimum number of pages of the memory, if any.
@@ -598,7 +598,7 @@ pub struct Builder<'a, TCodeAlloc: Allocator, TCtxt> {
     wasm: &'a [u8],
     code_allocator: TCodeAlloc,
     /// Callbacks registered with [`Builder::register_import`], in order.
-    import_callbacks: Vec<fn(&mut TCtxt, ParamsAccess<'_>) -> Outcome>,
+    import_callbacks: Vec<Box<dyn Fn(&mut TCtxt, ParamsAccess<'_>) -> Outcome>>,
 }
 
 impl<'a, TCodeAlloc: Allocator, TCtxt> Builder<'a, TCodeAlloc, TCtxt> {
@@ -648,8 +648,11 @@ impl<'a, TCodeAlloc: Allocator, TCtxt> Builder<'a, TCodeAlloc, TCtxt> {
     /// Otherwise, the execution is abandoned and [`Instance::call`] or [`Instance::resume`]
     /// returns [`Error::BadArgs`].
     #[inline]
-    pub fn register_import(&mut self, callback: fn(&mut TCtxt, ParamsAccess<'_>) -> Outcome) {
-        self.import_callbacks.push(callback);
+    pub fn register_import(
+        &mut self,
+        callback: impl Fn(&mut TCtxt, ParamsAccess<'_>) -> Outcome + 'static,
+    ) {
+        self.import_callbacks.push(Box::new(callback));
     }
 
     /// Parses, validates and compiles the Wasm module.

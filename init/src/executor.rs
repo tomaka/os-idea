@@ -78,11 +78,50 @@ pub struct ModulesRegistry<TCodeAlloc: Allocator> {
 }
 
 /// Prototype for a [`Module`].
-pub struct ModuleBuilder<'a> {
+///
+/// The handlers of the interfaces set with [`ModuleBuilder::set_interface_as_native`] receive a
+/// mutable reference to a `TCtxt`.
+pub struct ModuleBuilder<'a, TCtxt> {
     /// Wasm bytecode of the module. Not validated yet.
     wasm: &'a [u8],
     /// Imported functions of the module, ordered by import index.
     imports: Vec<ModuleImport>,
+    /// Native handler of each imported function, or `None` if the import parks the execution.
+    /// Ordered the same way as `imports`.
+    native_handlers: Vec<Option<fn(&mut TCtxt, MessageAccess<'_>) -> Outcome>>,
+}
+
+/// Access to a message that the Wasm code sends on an interface handled natively. See
+/// [`ModuleBuilder::set_interface_as_native`].
+#[derive(Clone, Copy)]
+pub struct MessageAccess<'a> {
+    /// Parameters passed by the Wasm code to the imported function.
+    inner: low_level_vm::ParamsAccess<'a>,
+}
+
+impl MessageAccess<'_> {
+    /// Returns the parameter that the Wasm code has passed to the imported function.
+    pub fn raw_param(&self) -> low_level_vm::Value {
+        // `low_level_vm::Builder::build` checks that all imports have exactly one parameter.
+        self.inner.get(0).unwrap_or_else(|| unreachable!())
+    }
+}
+
+impl fmt::Debug for MessageAccess<'_> {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.inner, f)
+    }
+}
+
+/// Value returned by the handlers registered with [`ModuleBuilder::set_interface_as_native`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// Continue the execution of the Wasm code immediately, with this value as return value of
+    /// the imported function.
+    Resume(low_level_vm::Value),
+    /// Suspend the execution of the Wasm code, as if the interface wasn't handled natively.
+    Park,
 }
 
 /// Function imported by a [`Module`].
@@ -136,7 +175,7 @@ impl fmt::Display for ModuleBuilderError {
     }
 }
 
-impl<'a> ModuleBuilder<'a> {
+impl<'a, TCtxt> ModuleBuilder<'a, TCtxt> {
     /// Parses the imports of the given Wasm module.
     ///
     /// Each imported function must be in a module named `interface_<hex>`, where `<hex>` is the
@@ -206,13 +245,38 @@ impl<'a> ModuleBuilder<'a> {
             }
         }
 
-        Ok(ModuleBuilder { wasm, imports })
+        let native_handlers = alloc::vec![None; imports.len()];
+        Ok(ModuleBuilder {
+            wasm,
+            imports,
+            native_handlers,
+        })
     }
 
-    /// Returns the list of imported functions, ordered by import index.
-    #[inline]
-    pub fn imports_by_index(&self) -> impl ExactSizeIterator<Item = ModuleImport> {
-        self.imports.iter().copied()
+    /// Makes the `request` and `notification` imported functions of the given interface call
+    /// `handler` directly, instead of parking the execution. Overwrites any previously-set
+    /// handler for this interface.
+    ///
+    /// Has no effect if the module doesn't use this interface.
+    ///
+    /// `handler` is called directly by the compiled Wasm code. See
+    /// [`low_level_vm::Builder::register_import`] for the constraints that apply to it.
+    pub fn set_interface_as_native(
+        &mut self,
+        interface: [u8; 32],
+        handler: fn(&mut TCtxt, MessageAccess<'_>) -> Outcome,
+    ) {
+        for (import, native_handler) in self.imports.iter().zip(&mut self.native_handlers) {
+            match import {
+                ModuleImport::Request { interface: i }
+                | ModuleImport::Notification { interface: i }
+                    if *i == interface =>
+                {
+                    *native_handler = Some(handler);
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Validates and compiles the Wasm module.
@@ -222,10 +286,21 @@ impl<'a> ModuleBuilder<'a> {
     pub fn build<TCodeAlloc: Allocator>(
         self,
         code_allocator: TCodeAlloc,
-    ) -> Result<Module<TCodeAlloc>, low_level_vm::Error> {
+    ) -> Result<Module<TCodeAlloc, TCtxt>, low_level_vm::Error>
+    where
+        TCtxt: 'static,
+    {
         let mut builder = low_level_vm::Builder::new(self.wasm, code_allocator);
-        for _ in &self.imports {
-            builder.register_import(|_, _| low_level_vm::Outcome::Park);
+        for native_handler in self.native_handlers {
+            match native_handler {
+                Some(handler) => builder.register_import(move |ctxt, params| {
+                    match handler(ctxt, MessageAccess { inner: params }) {
+                        Outcome::Resume(value) => low_level_vm::Outcome::Resume(value),
+                        Outcome::Park => low_level_vm::Outcome::Park,
+                    }
+                }),
+                None => builder.register_import(|_, _| low_level_vm::Outcome::Park),
+            }
         }
 
         let mut interfaces =
@@ -237,7 +312,7 @@ impl<'a> ModuleBuilder<'a> {
                 })
                 .collect::<Vec<_>>();
         interfaces.sort_unstable();
-        interfaces.dedup();
+        interfaces.dedup(); // TODO: no, error
 
         Ok(Module {
             inner: builder.build()?,
@@ -249,35 +324,18 @@ impl<'a> ModuleBuilder<'a> {
 
 /// A compiled Wasm module whose imported functions are all interface requests or
 /// notifications. See [`ModuleBuilder`].
-pub struct Module<TCodeAlloc: Allocator> {
-    // TODO: `()` is a placeholder for the context of the instances
-    /// The compiled module. All its imports park the execution.
-    inner: low_level_vm::Module<TCodeAlloc, ()>,
+pub struct Module<TCodeAlloc: Allocator, TCtxt> {
+    /// The compiled module.
+    inner: low_level_vm::Module<TCodeAlloc, TCtxt>,
     /// Imported functions of the module, ordered by import index.
+    // TODO: remove?
     imports: Vec<ModuleImport>,
     /// Interfaces used by the imported functions, sorted and without duplicates.
     interfaces: Vec<[u8; 32]>,
 }
 
-impl<TCodeAlloc: Allocator> Module<TCodeAlloc> {
-    /// Returns the list of imported functions, ordered by import index.
-    ///
-    /// The index of an import is the one found in [`low_level_vm::RunOutcome::ImportCall`].
-    #[inline]
-    pub fn imports_by_index(&self) -> impl ExactSizeIterator<Item = ModuleImport> {
-        self.imports.iter().copied()
-    }
-
-    /// Returns the list of interfaces that this module uses, sorted by identifier and without
-    /// duplicates.
-    #[inline]
-    pub fn interfaces_sorted(&self) -> impl ExactSizeIterator<Item = [u8; 32]> {
-        self.interfaces.iter().copied()
-    }
-}
-
 /// Prototype for an instance of a [`Module`].
-pub struct InstanceBuilder<TModule, TCodeAlloc: Allocator> {
+pub struct InstanceBuilder<TModule, TCodeAlloc: Allocator, TCtxt> {
     /// Module to instantiate.
     module: TModule,
     /// Private key of the instance.
@@ -285,12 +343,12 @@ pub struct InstanceBuilder<TModule, TCodeAlloc: Allocator> {
     /// Public key of the program handling each interface used by the module, or `None` if not
     /// set yet. Ordered the same way as [`Module::interfaces`].
     interface_handlers: Vec<Option<[u8; 32]>>,
-    /// Marker for the `TCodeAlloc` generic parameter.
-    marker: PhantomData<fn() -> TCodeAlloc>,
+    /// Marker for the `TCodeAlloc` and `TCtxt` generic parameters.
+    marker: PhantomData<fn() -> (TCodeAlloc, TCtxt)>,
 }
 
-impl<TModule: AsRef<Module<TCodeAlloc>>, TCodeAlloc: Allocator>
-    InstanceBuilder<TModule, TCodeAlloc>
+impl<TModule: AsRef<Module<TCodeAlloc, TCtxt>>, TCodeAlloc: Allocator, TCtxt>
+    InstanceBuilder<TModule, TCodeAlloc, TCtxt>
 {
     /// Initializes a new builder for an instance of the given module.
     ///
