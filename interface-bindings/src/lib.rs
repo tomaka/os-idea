@@ -33,7 +33,10 @@ use quote::quote;
 ///   lifetime parameter.
 /// - One `emit_foo(request: &Foo)` function per message of the interface, where `foo` is the
 ///   name of the request or notification. If the message expects a response, the function
-///   returns that response.
+///   returns that response. The function CBOR-encodes its parameter and passes a pointer to and
+///   the length of the encoding to the function named `request` or `notification` imported from
+///   the Wasm module named `interface_<hex>`, where `<hex>` is the lowercase hexadecimal
+///   representation of `HASH`. Calling these functions panics on targets other than Wasm.
 /// - A `decode(data)` function on every generated type, that decodes a value of that type from
 ///   its CBOR encoding, and a `DecodeError` type returned when decoding fails. Indefinite-length
 ///   CBOR items and tags aren't supported. A `decode_partial(data)` function is also generated,
@@ -143,7 +146,9 @@ fn interface_bindings_common(
         }
     };
 
-    let content = match generate(&definition, with_emit_functions) {
+    let hash = definition.hash();
+
+    let content = match generate(&definition, &hash, with_emit_functions) {
         Ok(content) => content,
         Err(err) => {
             return syn::Error::new_spanned(
@@ -157,8 +162,6 @@ fn interface_bindings_common(
             .into();
         }
     };
-
-    let hash = definition.hash();
 
     quote! {
         pub mod #module_name {
@@ -183,12 +186,23 @@ fn interface_bindings_common(
 
 /// Generates the content of the module corresponding to the given interface definition.
 ///
+/// `hash` must be the hash of `definition`. It determines the name of the Wasm module that the
+/// `emit_foo` functions import their FFI function from.
+///
 /// If `with_emit_functions` is `false`, the `emit_foo` functions aren't generated. The messages
 /// are still validated and the types of their responses are still generated.
 fn generate(
     definition: &interface_parser::InterfaceDefinition,
+    hash: &[u8; 32],
     with_emit_functions: bool,
 ) -> Result<TokenStream, String> {
+    let import_module = hash
+        .iter()
+        .fold(String::from("interface_"), |mut name, byte| {
+            name.push_str(&format!("{byte:02x}"));
+            name
+        });
+
     let root_name = definition.rules[0].name.as_str();
 
     let mut generator = Generator {
@@ -293,17 +307,46 @@ fn generate(
         };
 
         if with_emit_functions {
+            let ffi_call = if response.is_some() {
+                quote! {
+                    // SAFETY: the pointer and length designate a valid buffer, alive for the
+                    // entire duration of the call.
+                    unsafe { __ffi::request(encoded.as_ptr(), encoded.len()) };
+                    // TODO: decode the response
+                    unimplemented!()
+                }
+            } else {
+                quote! {
+                    // SAFETY: the pointer and length designate a valid buffer, alive for the
+                    // entire duration of the call.
+                    unsafe { __ffi::notification(encoded.as_ptr(), encoded.len()) };
+                }
+            };
+
             emit_functions.push(quote! {
                 pub fn #function_ident #generics (request: &#request_type) #return_type {
-                    let _ = request;
-                    unimplemented!()
+                    let mut encoded = alloc::vec::Vec::new();
+                    request
+                        .clone()    // TODO: don't clone?
+                        .encode_into(|bytes| encoded.extend_from_slice(bytes));
+
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        #ffi_call
+                    }
+
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let _ = encoded;
+                        panic!("emitting messages is only supported on Wasm")
+                    }
                 }
             });
         }
     }
 
     let items = generator.items;
-    Ok(quote! {
+    let content = quote! {
         /// Error that can happen when decoding a value from CBOR.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub enum DecodeError {
@@ -619,6 +662,26 @@ fn generate(
 
         #(#items)*
         #(#emit_functions)*
+    };
+
+    if !with_emit_functions {
+        return Ok(content);
+    }
+
+    Ok(quote! {
+        #content
+
+        /// Functions imported from the environment, used to emit messages on the interface.
+        #[cfg(target_arch = "wasm32")]
+        mod __ffi {
+            #[link(wasm_import_module = #import_module)]
+            unsafe extern "C" {
+                /// Sends a request whose CBOR encoding is the `len` bytes starting at `ptr`.
+                pub(super) fn request(ptr: *const u8, len: usize);
+                /// Sends a notification whose CBOR encoding is the `len` bytes starting at `ptr`.
+                pub(super) fn notification(ptr: *const u8, len: usize);
+            }
+        }
     })
 }
 
