@@ -27,6 +27,7 @@ pub fn run(config: Config) -> ! {
             for (name, wasm, expected) in [
                 ("general", TEST_WASM, Ok(vec![vm::Value::I32(42)])),
                 ("imports", TEST_IMPORTS_WASM, Ok(vec![vm::Value::I32(42)])),
+                ("memory grow", TEST_MEMORY_GROW_WASM, Ok(vec![vm::Value::I32(42)])),
                 (
                     "unreachable",
                     TEST_UNREACHABLE_WASM,
@@ -78,7 +79,12 @@ pub fn run(config: Config) -> ! {
                 vm::Builder::new(TEST_REUSE_WASM, mmap_alloc::Mmap::read_write_exec()).build();
             let reuse_result = reuse_result.and_then(|module| {
                 let mut instance =
-                    vm::Instance::new(&module, &trap_handlers, mmap_alloc::Mmap::read_write())?;
+                    vm::Instance::new(
+                    &module,
+                    &trap_handlers,
+                    mmap_alloc::Mmap::read_write(),
+                    mmap_alloc::Mmap::read_write(),
+                )?;
                 let first = instance.call("incr", &[]);
                 let trap = instance.call("trap", &[]);
                 let second = instance.call("incr", &[]);
@@ -161,7 +167,12 @@ fn run_wasm(
         builder.register_import(|_| vm::Outcome::Park);
     }
     let module = builder.build()?;
-    let mut instance = vm::Instance::new(&module, trap_handlers, mmap_alloc::Mmap::read_write())?;
+    let mut instance = vm::Instance::new(
+        &module,
+        trap_handlers,
+        mmap_alloc::Mmap::read_write(),
+        mmap_alloc::Mmap::read_write(),
+    )?;
     let mut outcome = instance.call("main", &[])?;
     loop {
         match outcome {
@@ -242,6 +253,26 @@ const TEST_IMPORTS_WASM: &[u8] = &wat_to_wasm::wat_to_wasm!(
     (i32.sub
       (i32.add (local.get $x) (call $add_one (call $add_two (i32.const 39))))
       (i32.const 1000)))
+)
+"#
+);
+
+/// Grows the memory and checks that its content is preserved, that the new pages are zeroed and
+/// accessible, and that the maximum is respected. Returns 42.
+const TEST_MEMORY_GROW_WASM: &[u8] = &wat_to_wasm::wat_to_wasm!(
+    r#"
+(module
+  (memory 1 2)
+  (data (i32.const 8) "\2a")
+  (func (export "main") (result i32)
+    (if (i32.ne (memory.grow (i32.const 1)) (i32.const 1)) (then (return (i32.const 1))))
+    (if (i32.ne (memory.size) (i32.const 2)) (then (return (i32.const 2))))
+    (if (i32.ne (i32.load (i32.const 70000)) (i32.const 0)) (then (return (i32.const 3))))
+    (i32.store (i32.const 131068) (i32.const 7))
+    (if (i32.ne (i32.load (i32.const 131068)) (i32.const 7)) (then (return (i32.const 4))))
+    (if (i32.ne (memory.grow (i32.const 1)) (i32.const -1)) (then (return (i32.const 5))))
+    (if (i32.ne (memory.grow (i32.const 0)) (i32.const 2)) (then (return (i32.const 6))))
+    (i32.load8_u (i32.const 8)))
 )
 "#
 );

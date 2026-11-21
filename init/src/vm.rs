@@ -11,7 +11,7 @@
 //! - Only `i32` and `i64` value types (no floats, no SIMD, no references).
 //! - Control flow (`block`, `loop`, `if`/`else`, `br`, `br_if`, `br_table`, `return`,
 //!   `unreachable`), direct calls, locals, globals, all integer arithmetic.
-//! - At most one linear memory, with explicit bounds checks. `memory.grow` always fails.
+//! - At most one linear memory, with explicit bounds checks.
 //!
 //! # Execution model
 //!
@@ -35,8 +35,9 @@
 //! code (through `init_vm_call_import`), on the Wasm stack and without any stack switch. If a
 //! callback returns [`Outcome::Resume`], the Wasm code continues immediately.
 //!
-//! The memory of the compiled code and of the native stacks is obtained from implementations
-//! of [`Allocator`] passed by the user.
+//! The memory of the compiled code, of the native stacks, and of the linear memories is
+//! obtained from implementations of [`Allocator`] passed by the user. `memory.grow` calls
+//! [`Allocator::grow_zeroed`] on the allocator of the linear memory of the instance.
 //!
 //! TODO: restore guard pages below the native stacks, in order to reliably detect stack
 //! overflows. Right now, a stack overflow overwrites whatever memory is below the stack.
@@ -53,16 +54,16 @@ use core::{
 use std::collections::BTreeMap;
 
 use cranelift_codegen::{
-    Context, FinalizedRelocTarget,
     binemit::Reloc,
     control::ControlPlane,
     ir::{
-        self, AbiParam, BlockArg, BlockCall, ExtFuncData, ExternalName, InstBuilder,
-        JumpTableData, MemFlagsData, Signature, TrapCode, UserExternalName, UserFuncName,
-        condcodes::IntCC, types,
+        self, condcodes::IntCC, types, AbiParam, BlockArg, BlockCall, ExtFuncData, ExternalName,
+        InstBuilder, JumpTableData, MemFlagsData, Signature, TrapCode, UserExternalName,
+        UserFuncName,
     },
     isa::{CallConv, OwnedTargetIsa},
     settings::{self, Configurable as _},
+    Context, FinalizedRelocTarget,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use wasmparser::{BlockType, FuncType, Operator, Payload, ValType};
@@ -83,6 +84,8 @@ const STACK_LAYOUT: Layout = match Layout::from_size_align(1024 * 1024, 16) {
     Ok(layout) => layout,
     Err(_) => panic!(),
 };
+/// Alignment of the allocations of the linear memory of each instance.
+const MEMORY_ALIGN: usize = 16;
 /// Size in bytes of the alternate signal stack, if one has to be allocated.
 const SIGNAL_STACK_SIZE: usize = 64 * 1024;
 
@@ -246,6 +249,61 @@ unsafe extern "sysv64" fn init_vm_call_import(
     }
 }
 
+/// Called by the Wasm code in order to execute `memory.grow`, with the number of pages to add
+/// to the memory, on the Wasm stack.
+///
+/// Grows the memory with [`Allocator::grow_zeroed`] and returns the previous number of pages,
+/// or `u32::MAX` if the memory can't be grown.
+///
+/// `TMemAlloc` must be the type of the allocator that `mem_allocator` points to.
+///
+/// Note that a panic in the allocator aborts the process, as unwinding out of this function
+/// isn't possible.
+unsafe extern "sysv64" fn init_vm_memory_grow<TMemAlloc: Allocator>(
+    vmctx: *mut VmCtx,
+    delta: u32,
+) -> u32 {
+    unsafe {
+        let old_len = (*vmctx).mem_len;
+        let old_pages = old_len / WASM_PAGE_SIZE;
+        // `mem_max_pages` is at most 65536, as checked by the validator, hence the number of
+        // pages always fits in a `u32` and is never equal to `u32::MAX`.
+        let old_pages_u32 = u32::try_from(old_pages).unwrap_or_else(|_| unreachable!());
+        // Can't overflow, as both numbers fit in 32 bits.
+        let new_pages = old_pages + u64::from(delta);
+        if new_pages > (*vmctx).mem_max_pages {
+            return u32::MAX;
+        }
+        if delta == 0 {
+            return old_pages_u32;
+        }
+
+        let new_len = new_pages * WASM_PAGE_SIZE;
+        let Some(new_layout) = usize::try_from(new_len)
+            .ok()
+            .and_then(|size| Layout::from_size_align(size, MEMORY_ALIGN).ok())
+        else {
+            return u32::MAX;
+        };
+        // The current memory has been successfully allocated with this layout.
+        let old_layout = Layout::from_size_align(
+            usize::try_from(old_len).unwrap_or_else(|_| unreachable!()),
+            MEMORY_ALIGN,
+        )
+        .unwrap_or_else(|_| unreachable!());
+
+        let allocator = &*(*vmctx).mem_allocator.cast::<TMemAlloc>();
+        match allocator.grow_zeroed((*vmctx).mem_base, old_layout, new_layout) {
+            Ok(new_memory) => {
+                (*vmctx).mem_base = new_memory.cast::<u8>();
+                (*vmctx).mem_len = new_len;
+                old_pages_u32
+            }
+            Err(_) => u32::MAX,
+        }
+    }
+}
+
 thread_local! {
     /// Context of the instance currently executing Wasm code on this thread, or null if none.
     ///
@@ -391,8 +449,17 @@ impl fmt::Display for Error {
 /// Context passed as hidden first parameter to every compiled function.
 #[repr(C)]
 struct VmCtx {
-    mem_base: *mut u8,
+    /// Linear memory, allocated with `mem_allocator`, [`MEMORY_ALIGN`] and a size of `mem_len`.
+    mem_base: NonNull<u8>,
+    /// Size in bytes of the linear memory. Always a multiple of [`WASM_PAGE_SIZE`].
     mem_len: u64,
+    /// Maximum number of pages of the linear memory. At most 65536.
+    mem_max_pages: u64,
+    /// Allocator of the linear memory, whose type is erased. Owned by the [`Instance`].
+    mem_allocator: *const (),
+    /// [`init_vm_memory_grow`] instantiated with the type of `mem_allocator`. Called by the
+    /// compiled code.
+    mem_grow: unsafe extern "sysv64" fn(*mut VmCtx, u32) -> u32,
     globals: *mut u64,
     /// Buffer used to pass parameters and results between the host and the Wasm code.
     values: *mut u64,
@@ -431,8 +498,16 @@ struct FuncSig {
 impl FuncSig {
     fn from_wasm(ty: &FuncType) -> Result<Self, Error> {
         Ok(FuncSig {
-            params: ty.params().iter().map(|t| val_type(*t)).collect::<Result<_, _>>()?,
-            results: ty.results().iter().map(|t| val_type(*t)).collect::<Result<_, _>>()?,
+            params: ty
+                .params()
+                .iter()
+                .map(|t| val_type(*t))
+                .collect::<Result<_, _>>()?,
+            results: ty
+                .results()
+                .iter()
+                .map(|t| val_type(*t))
+                .collect::<Result<_, _>>()?,
         })
     }
 
@@ -440,8 +515,10 @@ impl FuncSig {
     fn to_clif(&self) -> Signature {
         let mut sig = Signature::new(CallConv::SystemV);
         sig.params.push(AbiParam::new(types::I64));
-        sig.params.extend(self.params.iter().map(|t| AbiParam::new(*t)));
-        sig.returns.extend(self.results.iter().map(|t| AbiParam::new(*t)));
+        sig.params
+            .extend(self.params.iter().map(|t| AbiParam::new(*t)));
+        sig.returns
+            .extend(self.results.iter().map(|t| AbiParam::new(*t)));
         sig
     }
 }
@@ -486,6 +563,8 @@ pub struct Module<TCodeAlloc: Allocator> {
     exports: BTreeMap<String, (u32, usize)>,
     /// Minimum number of pages of the memory, if any.
     memory_pages: Option<u64>,
+    /// Maximum number of pages of the memory. 0 if there is no memory.
+    memory_max_pages: u64,
     globals: Vec<Value>,
     /// Active data segments: (offset in memory, bytes).
     data: Vec<(u32, Vec<u8>)>,
@@ -567,6 +646,7 @@ impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
         let mut imports = Vec::new();
         let mut func_types = Vec::new();
         let mut memory_pages = None;
+        let mut memory_max_pages = 0;
         let mut globals = Vec::new();
         let mut exports = Vec::new();
         let mut data = Vec::new();
@@ -594,6 +674,8 @@ impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
                             return Err(Error::Unsupported("multiple memories"));
                         }
                         memory_pages = Some(mem.initial);
+                        // The validator checks that the limits are at most 65536 pages.
+                        memory_max_pages = mem.maximum.unwrap_or(65536);
                     }
                 }
                 Payload::GlobalSection(reader) => {
@@ -726,6 +808,7 @@ impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
             import_callbacks,
             exports,
             memory_pages,
+            memory_max_pages,
             globals,
             data,
             traps,
@@ -751,7 +834,9 @@ impl<TCodeAlloc: Allocator> Drop for Module<TCodeAlloc> {
 
 fn build_isa() -> Result<OwnedTargetIsa, Error> {
     let mut flags = settings::builder();
-    flags.set("opt_level", "speed").map_err(|_| Error::Compile)?;
+    flags
+        .set("opt_level", "speed")
+        .map_err(|_| Error::Compile)?;
     flags.set("is_pic", "false").map_err(|_| Error::Compile)?;
     // Makes sure that functions with a large stack frame can't skip over the guard region.
     // TODO: there is no guard region at the moment, see the module-level documentation
@@ -871,8 +956,12 @@ impl Linker {
                 }
                 _ => return Err(Error::Unsupported("relocation target")),
             };
-            self.relocs
-                .push((base + reloc.offset as usize, reloc.kind, target, reloc.addend));
+            self.relocs.push((
+                base + reloc.offset as usize,
+                reloc.kind,
+                target,
+                reloc.addend,
+            ));
         }
 
         Ok(())
@@ -1090,8 +1179,8 @@ unsafe extern "C" fn trap_signal_handler(signal: u32, info: *mut u8, context: *m
 
 /// An instantiated module, with its own memory, globals, and native stack.
 ///
-/// The native stack is allocated with `TStackAlloc`.
-pub struct Instance<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator> {
+/// The native stack is allocated with `TStackAlloc`, and the linear memory with `TMemAlloc`.
+pub struct Instance<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator> {
     module: &'m Module<TCodeAlloc>,
     /// Obtained from `Box::into_raw`. Accessed by the compiled code, hence why it is a raw
     /// pointer.
@@ -1101,8 +1190,10 @@ pub struct Instance<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator> {
     /// [`STACK_LAYOUT`].
     stack: NonNull<u8>,
     stack_allocator: TStackAlloc,
+    /// Allocator of the linear memory, obtained from `Box::into_raw`. Accessed through
+    /// `vmctx` by [`init_vm_memory_grow`], hence why it is boxed and a raw pointer.
+    memory_allocator: NonNull<TMemAlloc>,
     // These fields are accessed through raw pointers in `vmctx`.
-    _memory: Vec<u8>,
     _globals: Vec<u64>,
     _values: Vec<u64>,
 }
@@ -1114,22 +1205,44 @@ enum InstanceState {
     Suspended { export_func: u32, import: u32 },
 }
 
-impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator> Instance<'m, TCodeAlloc, TStackAlloc> {
-    /// Instantiates the given module. Its native stack is allocated with `stack_allocator`.
+impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
+    Instance<'m, TCodeAlloc, TStackAlloc, TMemAlloc>
+{
+    /// Instantiates the given module. Its native stack is allocated with `stack_allocator`, and
+    /// its linear memory with `memory_allocator`.
+    ///
+    /// The linear memory is allocated with [`Allocator::allocate_zeroed`], and `memory.grow`
+    /// calls [`Allocator::grow_zeroed`]. These are called on the native stack of the instance
+    /// (see [`Builder::register_import`] for the consequences), and a panic in
+    /// [`Allocator::grow_zeroed`] aborts the process.
     pub fn new(
         module: &'m Module<TCodeAlloc>,
         _trap_handlers: &TrapHandlers,
         stack_allocator: TStackAlloc,
+        memory_allocator: TMemAlloc,
     ) -> Result<Self, Error> {
         let mem_len = module.memory_pages.unwrap_or(0) * WASM_PAGE_SIZE;
-        let mut memory = vec![0u8; usize::try_from(mem_len).map_err(|_| Error::Allocation)?];
+        let mem_layout = usize::try_from(mem_len)
+            .ok()
+            .and_then(|size| Layout::from_size_align(size, MEMORY_ALIGN).ok())
+            .ok_or(Error::Allocation)?;
+        let memory = memory_allocator
+            .allocate_zeroed(mem_layout)
+            .map_err(|_| Error::Allocation)?
+            .cast::<u8>();
+        // SAFETY: `memory` was just allocated with `mem_layout`, and is only accessed through
+        // this slice until the end of the loop below.
+        let memory_slice = unsafe { slice::from_raw_parts_mut(memory.as_ptr(), mem_layout.size()) };
         for (offset, bytes) in &module.data {
-            // Bounds were already checked by the validator only if the memory is large enough;
-            // check again to be safe.
-            let start = *offset as usize;
-            let dest = memory
-                .get_mut(start..start + bytes.len())
-                .ok_or(Error::Unsupported("out-of-bounds data segment"))?;
+            // The validator doesn't check that data segments fit in the memory.
+            let Some(dest) = usize::try_from(*offset)
+                .ok()
+                .and_then(|start| memory_slice.get_mut(start..)?.get_mut(..bytes.len()))
+            else {
+                // SAFETY: `memory` was allocated with `memory_allocator` and `mem_layout`.
+                unsafe { memory_allocator.deallocate(memory, mem_layout) };
+                return Err(Error::Unsupported("out-of-bounds data segment"));
+            };
             dest.copy_from_slice(bytes);
         }
 
@@ -1145,15 +1258,25 @@ impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator> Instance<'m, TCodeAlloc,
         let mut values = vec![0u64; module.values_len];
 
         // TODO: restore a guard region below the stack
-        let stack = stack_allocator
-            .allocate(STACK_LAYOUT)
-            .map_err(|_| Error::Allocation)?
-            .cast::<u8>();
+        let stack = match stack_allocator.allocate(STACK_LAYOUT) {
+            Ok(stack) => stack.cast::<u8>(),
+            Err(_) => {
+                // SAFETY: `memory` was allocated with `memory_allocator` and `mem_layout`.
+                unsafe { memory_allocator.deallocate(memory, mem_layout) };
+                return Err(Error::Allocation);
+            }
+        };
+
+        // Moving an allocator doesn't invalidate the memory blocks it has allocated.
+        let memory_allocator = NonNull::from(Box::leak(Box::new(memory_allocator)));
 
         let code_start = module.code.as_ptr() as u64;
         let vmctx = Box::into_raw(Box::new(VmCtx {
-            mem_base: memory.as_mut_ptr(),
+            mem_base: memory,
             mem_len,
+            mem_max_pages: module.memory_max_pages,
+            mem_allocator: memory_allocator.as_ptr().cast_const().cast::<()>(),
+            mem_grow: init_vm_memory_grow::<TMemAlloc>,
             globals: globals.as_mut_ptr(),
             values: values.as_mut_ptr(),
             import_idx: 0,
@@ -1175,7 +1298,7 @@ impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator> Instance<'m, TCodeAlloc,
             state: InstanceState::Idle,
             stack,
             stack_allocator,
-            _memory: memory,
+            memory_allocator,
             _globals: globals,
             _values: values,
         })
@@ -1194,13 +1317,13 @@ impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator> Instance<'m, TCodeAlloc,
         // with the expected registers, and with a stack pointer aligned on 16 bytes.
         let stack_top = self.stack.as_ptr() as u64 + STACK_LAYOUT.size() as u64;
         let frame: [u64; 9] = [
-            0,                                      // r15
-            module.code.as_ptr() as u64 + offset as u64, // r14: trampoline
-            unsafe { (*self.vmctx).values } as u64, // r13
-            self.vmctx as u64,                      // r12
-            0,                                      // rbx
-            0,                                      // rbp
-            (init_vm_fiber_start as *const ()).addr() as u64,    // return address
+            0,                                                // r15
+            module.code.as_ptr() as u64 + offset as u64,      // r14: trampoline
+            unsafe { (*self.vmctx).values } as u64,           // r13
+            self.vmctx as u64,                                // r12
+            0,                                                // rbx
+            0,                                                // rbp
+            (init_vm_fiber_start as *const ()).addr() as u64, // return address
             0,
             0,
         ];
@@ -1224,7 +1347,10 @@ impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator> Instance<'m, TCodeAlloc,
             return Err(Error::NotSuspended);
         };
         let module = self.module;
-        self.write_values(&module.funcs[import as usize].results, slice::from_ref(&result))?;
+        self.write_values(
+            &module.funcs[import as usize].results,
+            slice::from_ref(&result),
+        )?;
         self.run(export_func)
     }
 
@@ -1235,9 +1361,7 @@ impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator> Instance<'m, TCodeAlloc,
         let module = self.module;
 
         let previous = CURRENT_VMCTX.replace(vmctx);
-        let outcome = unsafe {
-            init_vm_switch(&raw mut (*vmctx).host_rsp, (*vmctx).wasm_rsp, 0)
-        };
+        let outcome = unsafe { init_vm_switch(&raw mut (*vmctx).host_rsp, (*vmctx).wasm_rsp, 0) };
         CURRENT_VMCTX.set(previous);
 
         match outcome {
@@ -1330,13 +1454,22 @@ impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator> Instance<'m, TCodeAlloc,
     }
 }
 
-impl<TCodeAlloc: Allocator, TStackAlloc: Allocator> Drop
-    for Instance<'_, TCodeAlloc, TStackAlloc>
+impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator> Drop
+    for Instance<'_, TCodeAlloc, TStackAlloc, TMemAlloc>
 {
     fn drop(&mut self) {
         // The Wasm stack contains no Rust frames, so a suspended execution can simply be
         // discarded.
-        unsafe { drop(Box::from_raw(self.vmctx)) };
+        let vmctx = unsafe { Box::from_raw(self.vmctx) };
+        let memory_allocator = unsafe { Box::from_raw(self.memory_allocator.as_ptr()) };
+        // The memory was successfully allocated or grown with this layout.
+        let mem_layout = Layout::from_size_align(
+            usize::try_from(vmctx.mem_len).unwrap_or_else(|_| unreachable!()),
+            MEMORY_ALIGN,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        // SAFETY: `mem_base` was allocated with `memory_allocator` and `mem_layout`.
+        unsafe { memory_allocator.deallocate(vmctx.mem_base, mem_layout) };
         // SAFETY: `stack` was allocated with `stack_allocator` and `STACK_LAYOUT`.
         unsafe { self.stack_allocator.deallocate(self.stack, STACK_LAYOUT) };
     }
@@ -1547,9 +1680,12 @@ impl<'a> Translator<'a> {
     }
 
     fn vmctx_load(&mut self, offset: usize) -> ir::Value {
-        self.builder
-            .ins()
-            .load(types::I64, MemFlagsData::trusted(), self.vmctx, offset as i32)
+        self.builder.ins().load(
+            types::I64,
+            MemFlagsData::trusted(),
+            self.vmctx,
+            offset as i32,
+        )
     }
 
     /// Pops a Wasm address, bounds-checks it, and returns the native address to access.
@@ -1779,9 +1915,7 @@ impl<'a> Translator<'a> {
                 self.builder.ins().return_(&rets);
                 self.reachable = false;
             }
-            Operator::Call { function_index }
-                if (function_index as usize) < self.num_imports =>
-            {
+            Operator::Call { function_index } if (function_index as usize) < self.num_imports => {
                 // Calling an import consists in calling `init_vm_call_import`, which calls the
                 // callback of the import and returns its result. If it indicates that the Wasm
                 // code must yield, the Wasm code switches back to the host with `init_vm_yield`,
@@ -1822,7 +1956,9 @@ impl<'a> Translator<'a> {
                 self.builder.ins().call(self.yield_ref, &[self.vmctx]);
                 let values = self.vmctx_load(offset_of!(VmCtx, values));
                 let parked_result =
-                    self.builder.ins().load(i64t, MemFlagsData::trusted(), values, 0);
+                    self.builder
+                        .ins()
+                        .load(i64t, MemFlagsData::trusted(), values, 0);
                 self.builder
                     .ins()
                     .jump(continue_block, &[BlockArg::Value(parked_result)]);
@@ -1965,9 +2101,21 @@ impl<'a> Translator<'a> {
                 self.stack.push(v);
             }
             Operator::MemoryGrow { .. } => {
-                // TODO: growing memory isn't supported; always report a failure
-                self.stack.pop().unwrap_or_else(|| unreachable!());
-                let v = self.builder.ins().iconst(i32t, -1);
+                // Calls the `init_vm_memory_grow` function stored in the `VmCtx`, which is
+                // specific to the type of allocator of the instance. The memory might move, but
+                // `mem_base` and `mem_len` are loaded again from the `VmCtx` at each access.
+                let delta = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let mut sig = Signature::new(CallConv::SystemV);
+                sig.params.push(AbiParam::new(i64t));
+                sig.params.push(AbiParam::new(i32t));
+                sig.returns.push(AbiParam::new(i32t));
+                let sig = self.builder.import_signature(sig);
+                let callee = self.vmctx_load(offset_of!(VmCtx, mem_grow));
+                let call = self
+                    .builder
+                    .ins()
+                    .call_indirect(sig, callee, &[self.vmctx, delta]);
+                let v = self.builder.inst_results(call)[0];
                 self.stack.push(v);
             }
 
@@ -2038,21 +2186,30 @@ impl<'a> Translator<'a> {
             Operator::I32LeU | Operator::I64LeU => {
                 let b = self.stack.pop().unwrap_or_else(|| unreachable!());
                 let a = self.stack.pop().unwrap_or_else(|| unreachable!());
-                let c = self.builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, a, b);
+                let c = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::UnsignedLessThanOrEqual, a, b);
                 let v = self.builder.ins().uextend(types::I32, c);
                 self.stack.push(v);
             }
             Operator::I32GeS | Operator::I64GeS => {
                 let b = self.stack.pop().unwrap_or_else(|| unreachable!());
                 let a = self.stack.pop().unwrap_or_else(|| unreachable!());
-                let c = self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, a, b);
+                let c = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::SignedGreaterThanOrEqual, a, b);
                 let v = self.builder.ins().uextend(types::I32, c);
                 self.stack.push(v);
             }
             Operator::I32GeU | Operator::I64GeU => {
                 let b = self.stack.pop().unwrap_or_else(|| unreachable!());
                 let a = self.stack.pop().unwrap_or_else(|| unreachable!());
-                let c = self.builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, a, b);
+                let c = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThanOrEqual, a, b);
                 let v = self.builder.ins().uextend(types::I32, c);
                 self.stack.push(v);
             }
