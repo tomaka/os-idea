@@ -79,7 +79,10 @@ unsafe impl<A: Allocator> Allocator for WithStackGuard<A> {
 
         // SAFETY: the inner allocation is at least `guard_size` bytes long.
         let ptr = unsafe { base.add(guard_size) };
-        Ok(NonNull::slice_from_raw_parts(ptr, inner_ptr.len() - guard_size))
+        Ok(NonNull::slice_from_raw_parts(
+            ptr,
+            inner_ptr.len() - guard_size,
+        ))
     }
 
     fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
@@ -111,7 +114,10 @@ unsafe impl<A: Allocator> Allocator for WithStackGuard<A> {
 
         // SAFETY: the inner allocation is at least `guard_size` bytes long.
         let ptr = unsafe { base.add(guard_size) };
-        Ok(NonNull::slice_from_raw_parts(ptr, inner_ptr.len() - guard_size))
+        Ok(NonNull::slice_from_raw_parts(
+            ptr,
+            inner_ptr.len() - guard_size,
+        ))
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {

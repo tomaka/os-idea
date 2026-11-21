@@ -1,3 +1,5 @@
+extern crate alloc;
+
 mod alloc_mmap;
 mod alloc_stack_guard;
 mod executor;
@@ -27,8 +29,16 @@ pub fn run(config: Config) -> ! {
         Ok(trap_handlers) => {
             for (name, wasm, expected) in [
                 ("general", TEST_WASM, Ok(vec![low_level_vm::Value::I32(42)])),
-                ("imports", TEST_IMPORTS_WASM, Ok(vec![low_level_vm::Value::I32(42)])),
-                ("memory grow", TEST_MEMORY_GROW_WASM, Ok(vec![low_level_vm::Value::I32(42)])),
+                (
+                    "imports",
+                    TEST_IMPORTS_WASM,
+                    Ok(vec![low_level_vm::Value::I32(42)]),
+                ),
+                (
+                    "memory grow",
+                    TEST_MEMORY_GROW_WASM,
+                    Ok(vec![low_level_vm::Value::I32(42)]),
+                ),
                 (
                     "unreachable",
                     TEST_UNREACHABLE_WASM,
@@ -77,10 +87,10 @@ pub fn run(config: Config) -> ! {
 
             // Check that an instance remains usable after a trap.
             let reuse_result =
-                low_level_vm::Builder::new(TEST_REUSE_WASM, alloc_mmap::Mmap::read_write_exec()).build();
+                low_level_vm::Builder::new(TEST_REUSE_WASM, alloc_mmap::Mmap::read_write_exec())
+                    .build();
             let reuse_result = reuse_result.and_then(|module| {
-                let mut instance =
-                    low_level_vm::Instance::new(
+                let mut instance = low_level_vm::Instance::new(
                     &module,
                     &trap_handlers,
                     (),
@@ -97,7 +107,9 @@ pub fn run(config: Config) -> ! {
                     Ok(low_level_vm::RunOutcome::Return(first)),
                     Err(low_level_vm::Error::Trap(low_level_vm::Trap::Unreachable)),
                     Ok(low_level_vm::RunOutcome::Return(second)),
-                )) if first == [low_level_vm::Value::I32(1)] && second == [low_level_vm::Value::I32(3)] => {
+                )) if first == [low_level_vm::Value::I32(1)]
+                    && second == [low_level_vm::Value::I32(3)] =>
+                {
                     println!("Test reuse after trap: OK");
                 }
                 other => println!("Test reuse after trap: FAIL: {other:?}"),
@@ -163,7 +175,9 @@ fn run_wasm(
     let mut builder = low_level_vm::Builder::new(wasm_bytes, alloc_mmap::Mmap::read_write_exec());
     if wasm_bytes == TEST_IMPORTS_WASM {
         builder.register_import(|_, params| match params.get(0) {
-            Some(low_level_vm::Value::I32(v)) => low_level_vm::Outcome::Resume(low_level_vm::Value::I32(v.wrapping_add(1))),
+            Some(low_level_vm::Value::I32(v)) => {
+                low_level_vm::Outcome::Resume(low_level_vm::Value::I32(v.wrapping_add(1)))
+            }
             _ => unreachable!(),
         });
         builder.register_import(|_, _| low_level_vm::Outcome::Park);

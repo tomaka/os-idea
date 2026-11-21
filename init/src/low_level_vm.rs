@@ -59,16 +59,15 @@ use std::collections::BTreeMap;
 use crate::alloc_stack_guard::{self, WithStackGuard};
 
 use cranelift_codegen::{
+    Context, FinalizedRelocTarget,
     binemit::Reloc,
     control::ControlPlane,
     ir::{
-        self, condcodes::IntCC, types, AbiParam, BlockArg, BlockCall, ExtFuncData, ExternalName,
-        InstBuilder, JumpTableData, MemFlagsData, Signature, TrapCode, UserExternalName,
-        UserFuncName,
+        self, AbiParam, BlockArg, BlockCall, ExtFuncData, ExternalName, InstBuilder, JumpTableData,
+        MemFlagsData, Signature, TrapCode, UserExternalName, UserFuncName, condcodes::IntCC, types,
     },
     isa::{CallConv, OwnedTargetIsa},
     settings::{self, Configurable as _},
-    Context, FinalizedRelocTarget,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use wasmparser::{BlockType, FuncType, Operator, Payload, ValType};
@@ -1437,8 +1436,8 @@ impl<
                 let pc = unsafe { (*vmctx).trap_pc };
 
                 let fault_addr = unsafe { (*vmctx).trap_addr };
-                let stack_start = u64::try_from(self.stack.as_ptr().addr())
-                    .unwrap_or_else(|_| unreachable!());
+                let stack_start =
+                    u64::try_from(self.stack.as_ptr().addr()).unwrap_or_else(|_| unreachable!());
                 let guard_start = stack_start
                     - u64::try_from(alloc_stack_guard::guard_size(STACK_LAYOUT))
                         .unwrap_or_else(|_| unreachable!());
