@@ -47,6 +47,7 @@ use core::{
     arch::global_asm,
     cell::Cell,
     fmt,
+    marker::PhantomData,
     mem::offset_of,
     ptr::{self, NonNull},
     slice,
@@ -896,6 +897,13 @@ impl<TCodeAlloc: Allocator> Module<TCodeAlloc> {
     }
 }
 
+impl<TCodeAlloc: Allocator> AsRef<Module<TCodeAlloc>> for Module<TCodeAlloc> {
+    #[inline]
+    fn as_ref(&self) -> &Module<TCodeAlloc> {
+        self
+    }
+}
+
 impl<TCodeAlloc: Allocator> Drop for Module<TCodeAlloc> {
     fn drop(&mut self) {
         // SAFETY: `code` was allocated with `code_allocator` and `code_layout`.
@@ -1143,8 +1151,13 @@ unsafe extern "C" fn trap_signal_handler(signal: u32, info: *mut u8, context: *m
 /// An instantiated module, with its own memory, globals, and native stack.
 ///
 /// The native stack is allocated with `TStackAlloc`, and the linear memory with `TMemAlloc`.
-pub struct Instance<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator> {
-    module: &'m Module<TCodeAlloc>,
+pub struct Instance<
+    TModule: AsRef<Module<TCodeAlloc>>,
+    TCodeAlloc: Allocator,
+    TStackAlloc: Allocator,
+    TMemAlloc: Allocator,
+> {
+    module: TModule,
     /// Obtained from `Box::into_raw`. Accessed by the compiled code, hence why it is a raw
     /// pointer.
     vmctx: *mut VmCtx,
@@ -1159,6 +1172,7 @@ pub struct Instance<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc
     // These fields are accessed through raw pointers in `vmctx`.
     _globals: Vec<u64>,
     _values: Vec<u64>,
+    _code_alloc: PhantomData<TCodeAlloc>,
 }
 
 enum InstanceState {
@@ -1168,8 +1182,12 @@ enum InstanceState {
     Suspended { export_func: u32, import: u32 },
 }
 
-impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
-    Instance<'m, TCodeAlloc, TStackAlloc, TMemAlloc>
+impl<
+    TModule: AsRef<Module<TCodeAlloc>>,
+    TCodeAlloc: Allocator,
+    TStackAlloc: Allocator,
+    TMemAlloc: Allocator,
+> Instance<TModule, TCodeAlloc, TStackAlloc, TMemAlloc>
 {
     /// Instantiates the given module. Its native stack is allocated with `stack_allocator`, and
     /// its linear memory with `memory_allocator`.
@@ -1179,12 +1197,13 @@ impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
     /// (see [`Builder::register_import`] for the consequences), and a panic in
     /// [`Allocator::grow_zeroed`] aborts the process.
     pub fn new(
-        module: &'m Module<TCodeAlloc>,
+        module: TModule,
         _trap_handlers: &TrapHandlers,
         stack_allocator: TStackAlloc,
         memory_allocator: TMemAlloc,
     ) -> Result<Self, Error> {
-        let mem_len = module.memory_pages.unwrap_or(0) * WASM_PAGE_SIZE;
+        let module_ref = module.as_ref();
+        let mem_len = module_ref.memory_pages.unwrap_or(0) * WASM_PAGE_SIZE;
         let mem_layout = usize::try_from(mem_len)
             .ok()
             .and_then(|size| Layout::from_size_align(size, MEMORY_ALIGN).ok())
@@ -1196,7 +1215,7 @@ impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
         // SAFETY: `memory` was just allocated with `mem_layout`, and is only accessed through
         // this slice until the end of the loop below.
         let memory_slice = unsafe { slice::from_raw_parts_mut(memory.as_ptr(), mem_layout.size()) };
-        for (offset, bytes) in &module.data {
+        for (offset, bytes) in &module_ref.data {
             // The validator doesn't check that data segments fit in the memory.
             let Some(dest) = usize::try_from(*offset)
                 .ok()
@@ -1209,7 +1228,7 @@ impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
             dest.copy_from_slice(bytes);
         }
 
-        let mut globals = module
+        let mut globals = module_ref
             .globals
             .iter()
             .map(|g| match *g {
@@ -1218,7 +1237,7 @@ impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
             })
             .collect::<Vec<u64>>();
 
-        let mut values = vec![0u64; module.values_len];
+        let mut values = vec![0u64; module_ref.values_len];
 
         // TODO: restore a guard region below the stack
         let stack = match stack_allocator.allocate(STACK_LAYOUT) {
@@ -1233,26 +1252,26 @@ impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
         // Moving an allocator doesn't invalidate the memory blocks it has allocated.
         let memory_allocator = NonNull::from(Box::leak(Box::new(memory_allocator)));
 
-        let code_start = module.code.as_ptr() as u64;
+        let code_start = module_ref.code.as_ptr() as u64;
         let vmctx = Box::into_raw(Box::new(VmCtx {
             mem_base: memory,
             mem_len,
-            mem_max_pages: module.memory_max_pages,
+            mem_max_pages: module_ref.memory_max_pages,
             mem_allocator: memory_allocator.as_ptr().cast_const().cast::<()>(),
             mem_grow: init_vm_memory_grow::<TMemAlloc>,
             globals: globals.as_mut_ptr(),
             values: values.as_mut_ptr(),
             import_idx: 0,
             bad_import_result: false,
-            funcs: module.funcs.as_ptr(),
-            import_callbacks: module.import_callbacks.as_ptr(),
+            funcs: module_ref.funcs.as_ptr(),
+            import_callbacks: module_ref.import_callbacks.as_ptr(),
             trap_signal: 0,
             trap_pc: 0,
             trap_addr: 0,
             host_rsp: 0,
             wasm_rsp: 0,
             code_start,
-            code_end: code_start + module.code_layout.size() as u64,
+            code_end: code_start + module_ref.code_layout.size() as u64,
         }));
 
         Ok(Instance {
@@ -1264,6 +1283,7 @@ impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
             memory_allocator,
             _globals: globals,
             _values: values,
+            _code_alloc: PhantomData,
         })
     }
 
@@ -1271,7 +1291,7 @@ impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
     ///
     /// If the execution of a previous call is suspended, it is discarded.
     pub fn call(&mut self, export: &str, args: &[Value]) -> Result<RunOutcome, Error> {
-        let module = self.module;
+        let module = self.module.as_ref();
         let (func_idx, offset) = *module.exports.get(export).ok_or(Error::NoSuchExport)?;
         self.write_values(&module.funcs[func_idx as usize].params, args)?;
         self.state = InstanceState::Idle;
@@ -1309,7 +1329,7 @@ impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
         else {
             return Err(Error::NotSuspended);
         };
-        let module = self.module;
+        let module = self.module.as_ref();
         self.write_values(
             &module.funcs[import as usize].results,
             slice::from_ref(&result),
@@ -1321,7 +1341,7 @@ impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
     /// gets suspended, or traps.
     fn run(&mut self, export_func: u32) -> Result<RunOutcome, Error> {
         let vmctx = self.vmctx;
-        let module = self.module;
+        let module = self.module.as_ref();
 
         let previous = CURRENT_VMCTX.replace(vmctx);
         let outcome = unsafe { init_vm_switch(&raw mut (*vmctx).host_rsp, (*vmctx).wasm_rsp, 0) };
@@ -1383,7 +1403,7 @@ impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
 
     /// Writes the given values to the buffer shared with the Wasm code, after checking that
     /// they match the given types.
-    fn write_values(&mut self, tys: &[ir::Type], values: &[Value]) -> Result<(), Error> {
+    fn write_values(&self, tys: &[ir::Type], values: &[Value]) -> Result<(), Error> {
         if values.len() != tys.len() {
             return Err(Error::BadArgs);
         }
@@ -1417,8 +1437,12 @@ impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
     }
 }
 
-impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator> Drop
-    for Instance<'_, TCodeAlloc, TStackAlloc, TMemAlloc>
+impl<
+    TModule: AsRef<Module<TCodeAlloc>>,
+    TCodeAlloc: Allocator,
+    TStackAlloc: Allocator,
+    TMemAlloc: Allocator,
+> Drop for Instance<TModule, TCodeAlloc, TStackAlloc, TMemAlloc>
 {
     fn drop(&mut self) {
         // The Wasm stack contains no Rust frames, so a suspended execution can simply be
