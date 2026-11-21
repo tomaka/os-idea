@@ -491,29 +491,28 @@ impl<
 
     /// Instantiates the module. The instance is initially ready to execute.
     ///
-    /// # Panic
-    ///
-    /// Panics if allocating the native stack or the linear memory of the instance fails, or if
-    /// a data segment of the module doesn't fit in its linear memory.
-    pub fn build(self) -> InstanceRef<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc> {
-        let instance = match low_level_vm::Instance::new(
+    /// Returns an error if allocating the native stack or the linear memory of the instance
+    /// fails, or if a data segment of the module doesn't fit in its linear memory.
+    // TODO: don't expose low_level_vm::Error
+    pub fn build(
+        self,
+    ) -> Result<InstanceRef<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>, low_level_vm::Error>
+    {
+        let instance = low_level_vm::Instance::new(
             InstanceModule(self.module),
             self.trap_handlers,
             self.ctxt,
             self.stack_allocator,
             self.memory_allocator,
-        ) {
-            Ok(instance) => instance,
-            Err(err) => panic!("failed to instantiate module: {err:?}"),
-        };
+        )?;
 
-        InstanceRef {
+        Ok(InstanceRef {
             inner: Arc::new(InstanceRefInner {
                 private_key: self.private_key,
                 interface_handlers: self.interface_handlers,
                 ready: atomicbox::AtomicOptionBox::new(Some(Box::new(instance))),
                 waiting_to_deliver: crossbeam_queue::SegQueue::new(),
             }),
-        }
+        })
     }
 }
