@@ -364,12 +364,32 @@ pub struct Module<TCodeAlloc: Allocator> {
     values_len: usize,
 }
 
-impl<TCodeAlloc: Allocator> Module<TCodeAlloc> {
-    /// Parses, validates and compiles the given Wasm module.
+/// Prototype for a [`Module`].
+pub struct Builder<'a, TCodeAlloc: Allocator> {
+    wasm: &'a [u8],
+    code_allocator: TCodeAlloc,
+}
+
+impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
+    /// Initializes a new builder for the given Wasm module.
     ///
-    /// The compiled code is written to memory allocated with `code_allocator`. This memory must
-    /// be executable.
-    pub fn new(wasm: &[u8], code_allocator: TCodeAlloc) -> Result<Self, Error> {
+    /// The compiled code will be written to memory allocated with `code_allocator`. This memory
+    /// must be executable.
+    #[inline]
+    pub fn new(wasm: &'a [u8], code_allocator: TCodeAlloc) -> Self {
+        Builder {
+            wasm,
+            code_allocator,
+        }
+    }
+
+    /// Parses, validates and compiles the Wasm module.
+    pub fn build(self) -> Result<Module<TCodeAlloc>, Error> {
+        let Builder {
+            wasm,
+            code_allocator,
+        } = self;
+
         wasmparser::Validator::new().validate_all(wasm)?;
 
         let mut types = Vec::new();
@@ -529,7 +549,9 @@ impl<TCodeAlloc: Allocator> Module<TCodeAlloc> {
             values_len,
         })
     }
+}
 
+impl<TCodeAlloc: Allocator> Module<TCodeAlloc> {
     /// Returns the list of imported functions, as `(module name, field name)`, ordered by
     /// import index.
     pub fn imports_by_index(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {

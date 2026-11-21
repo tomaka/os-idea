@@ -75,7 +75,7 @@ pub fn run(config: Config) -> ! {
 
             // Check that an instance remains usable after a trap.
             let reuse_result =
-                vm::Module::new(TEST_REUSE_WASM, mmap_alloc::Mmap::read_write_exec());
+                vm::Builder::new(TEST_REUSE_WASM, mmap_alloc::Mmap::read_write_exec()).build();
             let reuse_result = reuse_result.and_then(|module| {
                 let mut instance =
                     vm::Instance::new(&module, &trap_handlers, mmap_alloc::Mmap::read_write())?;
@@ -148,7 +148,7 @@ fn run_wasm(
     trap_handlers: &vm::TrapHandlers,
     wasm_bytes: &[u8],
 ) -> Result<Vec<vm::Value>, vm::Error> {
-    let module = vm::Module::new(wasm_bytes, mmap_alloc::Mmap::read_write_exec())?;
+    let module = vm::Builder::new(wasm_bytes, mmap_alloc::Mmap::read_write_exec()).build()?;
     let mut instance = vm::Instance::new(&module, trap_handlers, mmap_alloc::Mmap::read_write())?;
     let mut outcome = instance.call("main", &[])?;
     loop {
