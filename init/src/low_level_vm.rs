@@ -6,12 +6,14 @@
 //!
 //! Supported subset:
 //!
-//! - Function imports only, each with exactly one parameter and one result. No tables, no
-//!   start function.
+//! - Function imports only, each with exactly one parameter and one result. No start function.
 //! - Only `i32` and `i64` value types (no floats, no SIMD, no references).
 //! - Control flow (`block`, `loop`, `if`/`else`, `br`, `br_if`, `br_table`, `return`,
-//!   `unreachable`), direct calls, locals, globals, all integer arithmetic.
+//!   `unreachable`), direct and indirect calls, locals, globals, all integer arithmetic.
 //! - At most one linear memory, with explicit bounds checks.
+//! - Any number of non-imported `funcref` tables, initialized by active element segments and
+//!   only accessible through `call_indirect`. As no instruction can modify them, their content
+//!   is shared between all the instances of a module.
 //!
 //! # Execution model
 //!
@@ -371,6 +373,12 @@ pub enum Trap {
     IntegerOverflow,
     /// The native stack of the instance is exhausted.
     StackOverflow,
+    /// The index passed to `call_indirect` is out of the bounds of the table.
+    TableOutOfBounds,
+    /// The table element designated by `call_indirect` is null.
+    IndirectCallToNull,
+    /// The function designated by `call_indirect` doesn't have the expected signature.
+    BadSignature,
     /// The Wasm code has faulted for an unknown reason. Indicates a bug in the VM.
     Unknown,
 }
@@ -484,6 +492,8 @@ struct VmCtx {
     bad_import_result: bool,
     /// Signature of each function of the module, imported functions first.
     funcs: *const FuncSig,
+    /// Each table of the module. Points to the `table_infos` field of the [`Module`].
+    tables: *const TableInfo,
     /// Callback of each imported function, whose type is erased. Points to the
     /// `import_callbacks` field of the [`Module`].
     import_callbacks: *const (),
@@ -504,8 +514,28 @@ struct VmCtx {
     code_end: u64,
 }
 
+/// Location and size of a table, accessed by the compiled code.
+#[repr(C)]
+struct TableInfo {
+    /// Pointer to the first element of the table.
+    base: *const TableEntry,
+    /// Number of elements of the table.
+    len: u64,
+}
+
+/// Element of a table, accessed by the compiled code.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct TableEntry {
+    /// Address of the compiled function, or 0 if the element is null.
+    func: u64,
+    /// Identifier of the signature of the function. Two functions have the same identifier if
+    /// and only if they have the same signature. `u64::MAX` if the element is null.
+    type_id: u64,
+}
+
 /// Signature of a Wasm function, restricted to the supported types.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct FuncSig {
     params: Vec<ir::Type>,
     results: Vec<ir::Type>,
@@ -585,6 +615,12 @@ pub struct Module<TCodeAlloc: Allocator, TCtxt> {
     /// Maximum number of pages of the memory. 0 if there is no memory.
     memory_max_pages: u64,
     globals: Vec<Value>,
+    /// Content of each table, after initialization by the element segments. Accessed through
+    /// raw pointers in `table_infos`.
+    _tables: Vec<Vec<TableEntry>>,
+    /// Location of each element of `tables`. Pointed to by the `tables` field of the
+    /// [`VmCtx`]s.
+    table_infos: Vec<TableInfo>,
     /// Active data segments: (offset in memory, bytes).
     data: Vec<(u32, Vec<u8>)>,
     /// Offset in `code` of each trapping instruction => trap code.
@@ -673,6 +709,9 @@ impl<'a, TCodeAlloc: Allocator, TCtxt> Builder<'a, TCodeAlloc, TCtxt> {
         let mut globals = Vec::new();
         let mut exports = Vec::new();
         let mut data = Vec::new();
+        let mut tables = Vec::<Vec<TableEntry>>::new();
+        // Active element segments: (table index, offset in the table, function indices).
+        let mut elements = Vec::<(usize, usize, Vec<Option<u32>>)>::new();
         let mut bodies = Vec::new();
 
         for payload in wasmparser::Parser::new(0).parse_all(wasm) {
@@ -753,8 +792,93 @@ impl<'a, TCodeAlloc: Allocator, TCtxt> Builder<'a, TCodeAlloc, TCtxt> {
                     }
                 }
                 Payload::StartSection { .. } => return Err(Error::Unsupported("start function")),
-                Payload::TableSection(_) | Payload::ElementSection(_) => {
-                    return Err(Error::Unsupported("tables"));
+                Payload::TableSection(reader) => {
+                    for table in reader {
+                        let table = table?;
+                        if table.ty.element_type != wasmparser::RefType::FUNCREF
+                            || table.ty.table64
+                            || table.ty.shared
+                            || !matches!(table.init, wasmparser::TableInit::RefNull)
+                        {
+                            return Err(Error::Unsupported("non-standard table"));
+                        }
+                        let len =
+                            usize::try_from(table.ty.initial).map_err(|_| Error::Allocation)?;
+                        let mut entries = Vec::new();
+                        entries
+                            .try_reserve_exact(len)
+                            .map_err(|_| Error::Allocation)?;
+                        entries.resize(
+                            len,
+                            TableEntry {
+                                func: 0,
+                                type_id: u64::MAX,
+                            },
+                        );
+                        tables.push(entries);
+                    }
+                }
+                Payload::ElementSection(reader) => {
+                    for element in reader {
+                        let element = element?;
+                        // Passive and declared segments can only be used by instructions that
+                        // aren't supported, and can thus be ignored.
+                        let wasmparser::ElementKind::Active {
+                            table_index,
+                            offset_expr,
+                        } = element.kind
+                        else {
+                            continue;
+                        };
+                        let Value::I32(offset) = eval_const_expr(&offset_expr)? else {
+                            return Err(Error::Unsupported("element segment offset"));
+                        };
+                        let mut items = Vec::new();
+                        match element.items {
+                            wasmparser::ElementItems::Functions(reader) => {
+                                for func_idx in reader {
+                                    items.push(Some(func_idx?));
+                                }
+                            }
+                            wasmparser::ElementItems::Expressions(_, reader) => {
+                                for expr in reader {
+                                    let mut ops = expr?.get_operators_reader();
+                                    let item = match ops.read()? {
+                                        Operator::RefFunc { function_index } => {
+                                            Some(function_index)
+                                        }
+                                        Operator::RefNull { .. } => None,
+                                        _ => {
+                                            return Err(Error::Unsupported(
+                                                "non-trivial element expression",
+                                            ));
+                                        }
+                                    };
+                                    let Operator::End = ops.read()? else {
+                                        return Err(Error::Unsupported(
+                                            "non-trivial element expression",
+                                        ));
+                                    };
+                                    items.push(item);
+                                }
+                            }
+                        }
+                        // The table section always precedes the element section, and the
+                        // validator checks that the table exists.
+                        let table_index = usize::try_from(table_index.unwrap_or(0))
+                            .unwrap_or_else(|_| unreachable!());
+                        // The validator doesn't check that element segments fit in the table.
+                        let offset = usize::try_from(offset.cast_unsigned())
+                            .map_err(|_| Error::Unsupported("out-of-bounds element segment"))?;
+                        if tables[table_index]
+                            .len()
+                            .checked_sub(offset)
+                            .is_none_or(|room| room < items.len())
+                        {
+                            return Err(Error::Unsupported("out-of-bounds element segment"));
+                        }
+                        elements.push((table_index, offset, items));
+                    }
                 }
                 Payload::TagSection(_) => return Err(Error::Unsupported("exceptions")),
                 _ => {}
@@ -776,6 +900,31 @@ impl<'a, TCodeAlloc: Allocator, TCtxt> Builder<'a, TCodeAlloc, TCtxt> {
             .unwrap_or(0)
             .max(1);
 
+        // Identifier of the signature of each type, used to check the signature of the
+        // functions called with `call_indirect`. Wasm requires types to be compared
+        // structurally, hence why the identifier is the index of the first identical type.
+        let type_ids = types
+            .iter()
+            .map(|sig| {
+                let first = types
+                    .iter()
+                    .position(|other| other == sig)
+                    .unwrap_or_else(|| unreachable!());
+                u64::try_from(first).unwrap_or_else(|_| unreachable!())
+            })
+            .collect::<Vec<u64>>();
+
+        // Imported functions that are referenced by a table. Since tables contain compiled
+        // functions, a wrapper with the signature of a Wasm function is compiled for each of
+        // them, at the location of the function index in the `NAMESPACE_WASM_FUNC` namespace.
+        let mut wrapped_imports = elements
+            .iter()
+            .flat_map(|(_, _, items)| items.iter().flatten().copied())
+            .filter(|func_idx| (*func_idx as usize) < imports.len())
+            .collect::<Vec<u32>>();
+        wrapped_imports.sort_unstable();
+        wrapped_imports.dedup();
+
         let isa = build_isa()?;
         let mut ctx = Context::new();
         let mut builder_ctx = FunctionBuilderContext::new();
@@ -789,21 +938,59 @@ impl<'a, TCodeAlloc: Allocator, TCtxt> Builder<'a, TCodeAlloc, TCtxt> {
         // Offset in `code` of each trapping instruction => trap code.
         let mut traps = BTreeMap::<usize, TrapCode>::new();
 
-        // Compile all the Wasm functions, followed with one trampoline per exported function.
+        // Compile all the Wasm functions, followed with the wrappers of the imports referenced
+        // by a table, followed with one trampoline per exported function.
         // Bodies are those of the non-imported functions.
-        for item_idx in 0..(bodies.len() + exports.len()) {
+        for item_idx in 0..(bodies.len() + wrapped_imports.len() + exports.len()) {
             ctx.clear();
             let (namespace, index) = if let Some(body) = bodies.get(item_idx) {
                 let func_idx = imports.len() + item_idx;
                 ctx.func.signature = funcs[func_idx].to_clif();
                 let builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
-                let mut translator =
-                    Translator::new(builder, &types, &funcs, imports.len(), &globals, func_idx);
+                let mut translator = Translator::new(
+                    builder,
+                    &types,
+                    &type_ids,
+                    &funcs,
+                    imports.len(),
+                    &globals,
+                    func_idx,
+                );
                 translator.translate(body)?;
                 translator.builder.finalize(isa.frontend_config());
                 (NAMESPACE_WASM_FUNC, func_idx as u32)
+            } else if let Some(&import_idx) = wrapped_imports.get(item_idx - bodies.len()) {
+                // The wrapper simply passes its parameter to the import and returns its result.
+                // `Builder::build` checks that all imports have exactly one parameter and one
+                // result.
+                let func_idx = import_idx as usize;
+                ctx.func.signature = funcs[func_idx].to_clif();
+                let builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+                let mut translator = Translator::new(
+                    builder,
+                    &types,
+                    &type_ids,
+                    &funcs,
+                    imports.len(),
+                    &globals,
+                    func_idx,
+                );
+                let entry = translator
+                    .builder
+                    .current_block()
+                    .unwrap_or_else(|| unreachable!());
+                let param = translator.builder.block_params(entry)[1];
+                translator.stack.push(param);
+                translator.translate_op(Operator::Call {
+                    function_index: import_idx,
+                })?;
+                let result = translator.stack.pop().unwrap_or_else(|| unreachable!());
+                translator.builder.ins().return_(&[result]);
+                translator.builder.seal_all_blocks();
+                translator.builder.finalize(isa.frontend_config());
+                (NAMESPACE_WASM_FUNC, import_idx)
             } else {
-                let export_idx = item_idx - bodies.len();
+                let export_idx = item_idx - bodies.len() - wrapped_imports.len();
                 let func_idx = exports[export_idx].1;
                 if (func_idx as usize) < imports.len() {
                     return Err(Error::Unsupported("re-exported import"));
@@ -884,6 +1071,34 @@ impl<'a, TCodeAlloc: Allocator, TCtxt> Builder<'a, TCodeAlloc, TCtxt> {
             }
         }
 
+        // Initialize the tables, now that the addresses of the functions are known.
+        for (table_idx, offset, items) in elements {
+            // Element segments have been checked to fit in their table when parsing them.
+            let dest = &mut tables[table_idx][offset..][..items.len()];
+            for (entry, item) in dest.iter_mut().zip(items) {
+                *entry = match item {
+                    // Every function referenced by a table has been compiled, either because it
+                    // isn't an import or because it's in `wrapped_imports`.
+                    Some(func_idx) => TableEntry {
+                        func: (code_base + offsets[&(NAMESPACE_WASM_FUNC, func_idx)]) as u64,
+                        type_id: type_ids[func_types[func_idx as usize] as usize],
+                    },
+                    None => TableEntry {
+                        func: 0,
+                        type_id: u64::MAX,
+                    },
+                };
+            }
+        }
+        // Moving `tables` doesn't move the elements of the inner `Vec`s.
+        let table_infos = tables
+            .iter()
+            .map(|table| TableInfo {
+                base: table.as_ptr(),
+                len: u64::try_from(table.len()).unwrap_or_else(|_| unreachable!()),
+            })
+            .collect::<Vec<TableInfo>>();
+
         let exports = exports
             .into_iter()
             .enumerate()
@@ -904,6 +1119,8 @@ impl<'a, TCodeAlloc: Allocator, TCtxt> Builder<'a, TCodeAlloc, TCtxt> {
             memory_pages,
             memory_max_pages,
             globals,
+            _tables: tables,
+            table_infos,
             data,
             traps,
             values_len,
@@ -1300,6 +1517,7 @@ impl<
             import_idx: 0,
             bad_import_result: false,
             funcs: module_ref.funcs.as_ptr(),
+            tables: module_ref.table_infos.as_ptr(),
             import_callbacks: module_ref.import_callbacks.as_ptr().cast::<()>(),
             ctxt: ctxt.as_ptr().cast::<()>(),
             trap_signal: 0,
@@ -1460,6 +1678,9 @@ impl<
                     Some(&TrapCode::INTEGER_OVERFLOW) => Trap::IntegerOverflow,
                     Some(&TrapCode::STACK_OVERFLOW) => Trap::StackOverflow,
                     Some(code) if Some(*code) == TrapCode::user(1) => Trap::Unreachable,
+                    Some(code) if Some(*code) == TrapCode::user(2) => Trap::TableOutOfBounds,
+                    Some(code) if Some(*code) == TrapCode::user(3) => Trap::IndirectCallToNull,
+                    Some(code) if Some(*code) == TrapCode::user(4) => Trap::BadSignature,
                     _ => Trap::Unknown,
                 };
                 Err(Error::Trap(trap))
@@ -1564,6 +1785,8 @@ enum FrameKind {
 struct Translator<'a> {
     builder: FunctionBuilder<'a>,
     types: &'a [FuncSig],
+    /// Identifier of the signature of each entry of `types`. See [`TableEntry::type_id`].
+    type_ids: &'a [u64],
     funcs: &'a [FuncSig],
     /// Number of imported functions, which are the first entries of `funcs`.
     num_imports: usize,
@@ -1585,6 +1808,7 @@ impl<'a> Translator<'a> {
     fn new(
         mut builder: FunctionBuilder<'a>,
         types: &'a [FuncSig],
+        type_ids: &'a [u64],
         funcs: &'a [FuncSig],
         num_imports: usize,
         globals: &'a [Value],
@@ -1628,6 +1852,7 @@ impl<'a> Translator<'a> {
         Translator {
             builder,
             types,
+            type_ids,
             funcs,
             num_imports,
             globals,
@@ -2045,6 +2270,74 @@ impl<'a> Translator<'a> {
                 let call = self.builder.ins().call(func_ref, &args);
                 let results = self.builder.inst_results(call);
                 debug_assert_eq!(results.len(), num_results);
+                self.stack.extend_from_slice(results);
+            }
+            Operator::CallIndirect {
+                type_index,
+                table_index,
+            } => {
+                let types = self.types;
+                let sig = &types[type_index as usize];
+                let index = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let index = self.builder.ins().uextend(i64t, index);
+
+                // Load the location of the table, and check that the index is in bounds.
+                let tables = self.vmctx_load(offset_of!(VmCtx, tables));
+                let table_offset = table_index as usize * size_of::<TableInfo>();
+                let table_len = self.builder.ins().load(
+                    i64t,
+                    MemFlagsData::trusted(),
+                    tables,
+                    (table_offset + offset_of!(TableInfo, len)) as i32,
+                );
+                let table_base = self.builder.ins().load(
+                    i64t,
+                    MemFlagsData::trusted(),
+                    tables,
+                    (table_offset + offset_of!(TableInfo, base)) as i32,
+                );
+                let oob =
+                    self.builder
+                        .ins()
+                        .icmp(IntCC::UnsignedGreaterThanOrEqual, index, table_len);
+                self.builder.ins().trapnz(oob, TrapCode::user(2).unwrap_or_else(|| unreachable!()));
+
+                // Load the element, and check that it is non-null and has the right signature.
+                let entry_offset = self
+                    .builder
+                    .ins()
+                    .imul_imm_u(index, size_of::<TableEntry>() as i64);
+                let entry = self.builder.ins().iadd(table_base, entry_offset);
+                let callee = self.builder.ins().load(
+                    i64t,
+                    MemFlagsData::trusted(),
+                    entry,
+                    offset_of!(TableEntry, func) as i32,
+                );
+                self.builder
+                    .ins()
+                    .trapz(callee, TrapCode::user(3).unwrap_or_else(|| unreachable!()));
+                let type_id = self.builder.ins().load(
+                    i64t,
+                    MemFlagsData::trusted(),
+                    entry,
+                    offset_of!(TableEntry, type_id) as i32,
+                );
+                let bad_sig = self.builder.ins().icmp_imm_u(
+                    IntCC::NotEqual,
+                    type_id,
+                    self.type_ids[type_index as usize].cast_signed(),
+                );
+                self.builder
+                    .ins()
+                    .trapnz(bad_sig, TrapCode::user(4).unwrap_or_else(|| unreachable!()));
+
+                let sig_ref = self.builder.import_signature(sig.to_clif());
+                let mut args = vec![self.vmctx];
+                args.extend(self.stack.drain(self.stack.len() - sig.params.len()..));
+                let call = self.builder.ins().call_indirect(sig_ref, callee, &args);
+                let results = self.builder.inst_results(call);
+                debug_assert_eq!(results.len(), sig.results.len());
                 self.stack.extend_from_slice(results);
             }
 
