@@ -32,8 +32,9 @@
 //!   that abandons the Wasm stack and jumps back to the host stack.
 //!
 //! The callbacks registered with [`Builder::register_import`] are called directly by the Wasm
-//! code (through `init_vm_call_import`), on the Wasm stack and without any stack switch. If a
-//! callback returns [`Outcome::Resume`], the Wasm code continues immediately.
+//! code (through `init_vm_call_import`), on the Wasm stack and without any stack switch. They
+//! receive a mutable reference to the context passed to [`Instance::new`]. If a callback returns
+//! [`Outcome::Resume`], the Wasm code continues immediately.
 //!
 //! The memory of the compiled code, of the native stacks, and of the linear memories is
 //! obtained from implementations of [`Allocator`] passed by the user. `memory.grow` calls
@@ -210,9 +211,12 @@ struct CallImportOutput {
 /// execution, the import index and the parameter are written to `import_idx` and the values
 /// buffer before returning, so that the host can find them after the Wasm code has yielded.
 ///
+/// `TCtxt` must be the type of the context that `ctxt` points to, and `import_callbacks` must
+/// point to callbacks taking this context.
+///
 /// Note that a panic in the callback aborts the process, as unwinding out of this function
 /// isn't possible.
-unsafe extern "sysv64" fn init_vm_call_import(
+unsafe extern "sysv64" fn init_vm_call_import<TCtxt>(
     vmctx: *mut VmCtx,
     import: u32,
     param: u64,
@@ -224,7 +228,13 @@ unsafe extern "sysv64" fn init_vm_call_import(
             values: slice::from_ref(&param),
             tys: &sig.params,
         };
-        let outcome = (*(*vmctx).import_callbacks.add(import as usize))(params);
+        let callbacks = (*vmctx)
+            .import_callbacks
+            .cast::<fn(&mut TCtxt, ParamsAccess<'_>) -> Outcome>();
+        // The host can't access the context while the Wasm code runs, as `Instance::call` and
+        // `Instance::resume` take `&mut self`.
+        let ctxt = &mut *(*vmctx).ctxt.cast::<TCtxt>();
+        let outcome = (*callbacks.add(import as usize))(ctxt, params);
         // `Builder::build` checks that all imports have exactly one result.
         let result = match (outcome, sig.results[0]) {
             (Outcome::Resume(Value::I32(v)), types::I32) => u64::from(v as u32),
@@ -475,8 +485,11 @@ struct VmCtx {
     bad_import_result: bool,
     /// Signature of each function of the module, imported functions first.
     funcs: *const FuncSig,
-    /// Callback of each imported function.
-    import_callbacks: *const fn(ParamsAccess<'_>) -> Outcome,
+    /// Callback of each imported function, whose type is erased. Points to the
+    /// `import_callbacks` field of the [`Module`].
+    import_callbacks: *const (),
+    /// Context passed to the import callbacks, whose type is erased. Owned by the [`Instance`].
+    ctxt: *mut (),
     /// Signal number of the latest trap, written by the signal handler.
     trap_signal: u32,
     /// Instruction pointer of the latest trap, written by the signal handler.
@@ -552,7 +565,10 @@ fn eval_const_expr(expr: &wasmparser::ConstExpr) -> Result<Value, Error> {
 /// A compiled Wasm module.
 ///
 /// The compiled code is stored in memory allocated by `TCodeAlloc`, which must be executable.
-pub struct Module<TCodeAlloc: Allocator> {
+///
+/// The callbacks of the imports receive a mutable reference to a `TCtxt`, passed when creating
+/// an [`Instance`].
+pub struct Module<TCodeAlloc: Allocator, TCtxt> {
     /// Compiled code, allocated with `code_allocator` and `code_layout`.
     code: NonNull<u8>,
     code_layout: Layout,
@@ -562,7 +578,7 @@ pub struct Module<TCodeAlloc: Allocator> {
     /// Imported functions: (module name, field name).
     imports: Vec<(String, String)>,
     /// Callback of each imported function, in the same order as `imports`.
-    import_callbacks: Vec<fn(ParamsAccess<'_>) -> Outcome>,
+    import_callbacks: Vec<fn(&mut TCtxt, ParamsAccess<'_>) -> Outcome>,
     /// Exported functions: name => (function index, offset of the trampoline in `code`).
     exports: BTreeMap<String, (u32, usize)>,
     /// Minimum number of pages of the memory, if any.
@@ -579,14 +595,14 @@ pub struct Module<TCodeAlloc: Allocator> {
 }
 
 /// Prototype for a [`Module`].
-pub struct Builder<'a, TCodeAlloc: Allocator> {
+pub struct Builder<'a, TCodeAlloc: Allocator, TCtxt> {
     wasm: &'a [u8],
     code_allocator: TCodeAlloc,
     /// Callbacks registered with [`Builder::register_import`], in order.
-    import_callbacks: Vec<fn(ParamsAccess<'_>) -> Outcome>,
+    import_callbacks: Vec<fn(&mut TCtxt, ParamsAccess<'_>) -> Outcome>,
 }
 
-impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
+impl<'a, TCodeAlloc: Allocator, TCtxt> Builder<'a, TCodeAlloc, TCtxt> {
     /// Initializes a new builder for the given Wasm module.
     ///
     /// The compiled code will be written to memory allocated with `code_allocator`. This memory
@@ -606,8 +622,9 @@ impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
     /// and the number of registered imports must be equal to the number of imports of the Wasm
     /// module, otherwise [`Builder::build`] returns [`Error::ImportsCountMismatch`].
     ///
-    /// Whenever the Wasm code calls this import, `callback` is called with the parameter
-    /// passed by the Wasm code. See [`Outcome`].
+    /// Whenever the Wasm code calls this import, `callback` is called with the context of the
+    /// [`Instance`] (see [`Instance::new`]) and the parameter passed by the Wasm code. See
+    /// [`Outcome`].
     ///
     /// Only imported functions with exactly one parameter and one result are supported.
     ///
@@ -632,12 +649,12 @@ impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
     /// Otherwise, the execution is abandoned and [`Instance::call`] or [`Instance::resume`]
     /// returns [`Error::BadArgs`].
     #[inline]
-    pub fn register_import(&mut self, callback: fn(ParamsAccess<'_>) -> Outcome) {
+    pub fn register_import(&mut self, callback: fn(&mut TCtxt, ParamsAccess<'_>) -> Outcome) {
         self.import_callbacks.push(callback);
     }
 
     /// Parses, validates and compiles the Wasm module.
-    pub fn build(self) -> Result<Module<TCodeAlloc>, Error> {
+    pub fn build(self) -> Result<Module<TCodeAlloc, TCtxt>, Error> {
         let Builder {
             wasm,
             code_allocator,
@@ -849,7 +866,7 @@ impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
             let target_addr = if target == (NAMESPACE_HOST, 0) {
                 (init_vm_yield as *const ()).addr() as i64 + addend
             } else if target == (NAMESPACE_HOST, 1) {
-                (init_vm_call_import as *const ()).addr() as i64 + addend
+                (init_vm_call_import::<TCtxt> as *const ()).addr() as i64 + addend
             } else {
                 (code_base + offsets[&target]) as i64 + addend
             };
@@ -892,7 +909,7 @@ impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
     }
 }
 
-impl<TCodeAlloc: Allocator> Module<TCodeAlloc> {
+impl<TCodeAlloc: Allocator, TCtxt> Module<TCodeAlloc, TCtxt> {
     /// Returns the list of imported functions, as `(module name, field name)`, ordered by
     /// import index.
     pub fn imports_by_index(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {
@@ -900,14 +917,14 @@ impl<TCodeAlloc: Allocator> Module<TCodeAlloc> {
     }
 }
 
-impl<TCodeAlloc: Allocator> AsRef<Module<TCodeAlloc>> for Module<TCodeAlloc> {
+impl<TCodeAlloc: Allocator, TCtxt> AsRef<Module<TCodeAlloc, TCtxt>> for Module<TCodeAlloc, TCtxt> {
     #[inline]
-    fn as_ref(&self) -> &Module<TCodeAlloc> {
+    fn as_ref(&self) -> &Module<TCodeAlloc, TCtxt> {
         self
     }
 }
 
-impl<TCodeAlloc: Allocator> Drop for Module<TCodeAlloc> {
+impl<TCodeAlloc: Allocator, TCtxt> Drop for Module<TCodeAlloc, TCtxt> {
     fn drop(&mut self) {
         // SAFETY: `code` was allocated with `code_allocator` and `code_layout`.
         unsafe { self.code_allocator.deallocate(self.code, self.code_layout) };
@@ -1153,9 +1170,11 @@ unsafe extern "C" fn trap_signal_handler(signal: u32, info: *mut u8, context: *m
 /// An instantiated module, with its own memory, globals, and native stack.
 ///
 /// The native stack is allocated with `TStackAlloc`, and the linear memory with `TMemAlloc`.
+/// The instance owns a `TCtxt`, passed to the callbacks of the imports.
 pub struct Instance<
-    TModule: AsRef<Module<TCodeAlloc>>,
+    TModule: AsRef<Module<TCodeAlloc, TCtxt>>,
     TCodeAlloc: Allocator,
+    TCtxt,
     TStackAlloc: Allocator,
     TMemAlloc: Allocator,
 > {
@@ -1171,6 +1190,9 @@ pub struct Instance<
     /// Allocator of the linear memory, obtained from `Box::into_raw`. Accessed through
     /// `vmctx` by [`init_vm_memory_grow`], hence why it is boxed and a raw pointer.
     memory_allocator: NonNull<TMemAlloc>,
+    /// Context passed to the import callbacks, obtained from `Box::into_raw`. Accessed through
+    /// `vmctx` by [`init_vm_call_import`], hence why it is boxed and a raw pointer.
+    ctxt: NonNull<TCtxt>,
     // These fields are accessed through raw pointers in `vmctx`.
     _globals: Vec<u64>,
     _values: Vec<u64>,
@@ -1185,14 +1207,18 @@ enum InstanceState {
 }
 
 impl<
-    TModule: AsRef<Module<TCodeAlloc>>,
+    TModule: AsRef<Module<TCodeAlloc, TCtxt>>,
     TCodeAlloc: Allocator,
+    TCtxt,
     TStackAlloc: Allocator,
     TMemAlloc: Allocator,
-> Instance<TModule, TCodeAlloc, TStackAlloc, TMemAlloc>
+> Instance<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>
 {
     /// Instantiates the given module. Its native stack is allocated with `stack_allocator`, and
     /// its linear memory with `memory_allocator`.
+    ///
+    /// `ctxt` is passed to the callbacks of the imports (see [`Builder::register_import`]), and
+    /// can be accessed with [`Instance::ctxt`] and [`Instance::ctxt_mut`].
     ///
     /// The stack is allocated through a [`WithStackGuard`] wrapping around `stack_allocator`,
     /// meaning that the memory obtained from `stack_allocator` must be readable and writable,
@@ -1205,6 +1231,7 @@ impl<
     pub fn new(
         module: TModule,
         _trap_handlers: &TrapHandlers,
+        ctxt: TCtxt,
         stack_allocator: TStackAlloc,
         memory_allocator: TMemAlloc,
     ) -> Result<Self, Error> {
@@ -1257,6 +1284,7 @@ impl<
 
         // Moving an allocator doesn't invalidate the memory blocks it has allocated.
         let memory_allocator = NonNull::from(Box::leak(Box::new(memory_allocator)));
+        let ctxt = NonNull::from(Box::leak(Box::new(ctxt)));
 
         let code_start = module_ref.code.as_ptr() as u64;
         let vmctx = Box::into_raw(Box::new(VmCtx {
@@ -1270,7 +1298,8 @@ impl<
             import_idx: 0,
             bad_import_result: false,
             funcs: module_ref.funcs.as_ptr(),
-            import_callbacks: module_ref.import_callbacks.as_ptr(),
+            import_callbacks: module_ref.import_callbacks.as_ptr().cast::<()>(),
+            ctxt: ctxt.as_ptr().cast::<()>(),
             trap_signal: 0,
             trap_pc: 0,
             trap_addr: 0,
@@ -1287,10 +1316,27 @@ impl<
             stack,
             stack_allocator,
             memory_allocator,
+            ctxt,
             _globals: globals,
             _values: values,
             _code_alloc: PhantomData,
         })
+    }
+
+    /// Returns a reference to the context passed to [`Instance::new`].
+    #[inline]
+    pub fn ctxt(&self) -> &TCtxt {
+        // SAFETY: `ctxt` is valid, and only accessed mutably by the import callbacks while the
+        // Wasm code runs, which requires `&mut self`.
+        unsafe { self.ctxt.as_ref() }
+    }
+
+    /// Returns a mutable reference to the context passed to [`Instance::new`].
+    #[inline]
+    pub fn ctxt_mut(&mut self) -> &mut TCtxt {
+        // SAFETY: `ctxt` is valid, and only accessed by the import callbacks while the Wasm code
+        // runs, which requires `&mut self`.
+        unsafe { self.ctxt.as_mut() }
     }
 
     /// Starts executing the exported function with the given name.
@@ -1457,11 +1503,12 @@ impl<
 }
 
 impl<
-    TModule: AsRef<Module<TCodeAlloc>>,
+    TModule: AsRef<Module<TCodeAlloc, TCtxt>>,
     TCodeAlloc: Allocator,
+    TCtxt,
     TStackAlloc: Allocator,
     TMemAlloc: Allocator,
-> Drop for Instance<TModule, TCodeAlloc, TStackAlloc, TMemAlloc>
+> Drop for Instance<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>
 {
     fn drop(&mut self) {
         // The Wasm stack contains no Rust frames, so a suspended execution can simply be
@@ -1478,6 +1525,8 @@ impl<
         unsafe { memory_allocator.deallocate(vmctx.mem_base, mem_layout) };
         // SAFETY: `stack` was allocated with `stack_allocator` and `STACK_LAYOUT`.
         unsafe { self.stack_allocator.deallocate(self.stack, STACK_LAYOUT) };
+        // SAFETY: `ctxt` was obtained from `Box::into_raw`.
+        drop(unsafe { Box::from_raw(self.ctxt.as_ptr()) });
     }
 }
 

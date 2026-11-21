@@ -83,6 +83,7 @@ pub fn run(config: Config) -> ! {
                     low_level_vm::Instance::new(
                     &module,
                     &trap_handlers,
+                    (),
                     alloc_mmap::Mmap::read_write(),
                     alloc_mmap::Mmap::read_write(),
                 )?;
@@ -161,16 +162,17 @@ fn run_wasm(
 ) -> Result<Vec<low_level_vm::Value>, low_level_vm::Error> {
     let mut builder = low_level_vm::Builder::new(wasm_bytes, alloc_mmap::Mmap::read_write_exec());
     if wasm_bytes == TEST_IMPORTS_WASM {
-        builder.register_import(|params| match params.get(0) {
+        builder.register_import(|_, params| match params.get(0) {
             Some(low_level_vm::Value::I32(v)) => low_level_vm::Outcome::Resume(low_level_vm::Value::I32(v.wrapping_add(1))),
             _ => unreachable!(),
         });
-        builder.register_import(|_| low_level_vm::Outcome::Park);
+        builder.register_import(|_, _| low_level_vm::Outcome::Park);
     }
     let module = builder.build()?;
     let mut instance = low_level_vm::Instance::new(
         &module,
         trap_handlers,
+        (),
         alloc_mmap::Mmap::read_write(),
         alloc_mmap::Mmap::read_write(),
     )?;
