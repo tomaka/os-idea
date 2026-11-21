@@ -39,8 +39,9 @@
 //! obtained from implementations of [`Allocator`] passed by the user. `memory.grow` calls
 //! [`Allocator::grow_zeroed`] on the allocator of the linear memory of the instance.
 //!
-//! TODO: restore guard pages below the native stacks, in order to reliably detect stack
-//! overflows. Right now, a stack overflow overwrites whatever memory is below the stack.
+//! The allocator of the native stacks is wrapped in a [`WithStackGuard`], so that a stack
+//! overflow faults in the guard region below the stack instead of overwriting the memory located
+//! there. Such a fault is reported as [`Trap::StackOverflow`] if it happens in the Wasm code.
 
 use core::{
     alloc::{Allocator, Layout},
@@ -53,6 +54,8 @@ use core::{
     slice,
 };
 use std::collections::BTreeMap;
+
+use crate::alloc_stack_guard::{self, WithStackGuard};
 
 use cranelift_codegen::{
     binemit::Reloc,
@@ -615,9 +618,9 @@ impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
     /// of the [`Instance`] rather than on the stack of the host. As a consequence:
     ///
     /// - The callback shares the 1 MiB native stack of the instance with the Wasm code that is
-    ///   currently executing. It should avoid deep recursion and large stack allocations. There
-    ///   is currently no guard page below that stack, so a stack overflow in the callback
-    ///   silently corrupts the memory below it instead of crashing.
+    ///   currently executing. It should avoid deep recursion and large stack allocations. A
+    ///   stack overflow in the callback faults in the guard region below that stack, which kills
+    ///   the process (see below).
     /// - A panic in the callback aborts the entire process, because unwinding through the frames
     ///   of the Wasm code isn't possible.
     /// - A fault in the callback (for example a segmentation fault) isn't reported as a Wasm
@@ -918,7 +921,6 @@ fn build_isa() -> Result<OwnedTargetIsa, Error> {
         .map_err(|_| Error::Compile)?;
     flags.set("is_pic", "false").map_err(|_| Error::Compile)?;
     // Makes sure that functions with a large stack frame can't skip over the guard region.
-    // TODO: there is no guard region at the moment, see the module-level documentation
     flags
         .set("enable_probestack", "true")
         .map_err(|_| Error::Compile)?;
@@ -1165,7 +1167,7 @@ pub struct Instance<
     /// Native stack on which the Wasm code runs, allocated with `stack_allocator` and
     /// [`STACK_LAYOUT`].
     stack: NonNull<u8>,
-    stack_allocator: TStackAlloc,
+    stack_allocator: WithStackGuard<TStackAlloc>,
     /// Allocator of the linear memory, obtained from `Box::into_raw`. Accessed through
     /// `vmctx` by [`init_vm_memory_grow`], hence why it is boxed and a raw pointer.
     memory_allocator: NonNull<TMemAlloc>,
@@ -1191,6 +1193,10 @@ impl<
 {
     /// Instantiates the given module. Its native stack is allocated with `stack_allocator`, and
     /// its linear memory with `memory_allocator`.
+    ///
+    /// The stack is allocated through a [`WithStackGuard`] wrapping around `stack_allocator`,
+    /// meaning that the memory obtained from `stack_allocator` must be readable and writable,
+    /// and that `mprotect` must be usable on it.
     ///
     /// The linear memory is allocated with [`Allocator::allocate_zeroed`], and `memory.grow`
     /// calls [`Allocator::grow_zeroed`]. These are called on the native stack of the instance
@@ -1239,7 +1245,7 @@ impl<
 
         let mut values = vec![0u64; module_ref.values_len];
 
-        // TODO: restore a guard region below the stack
+        let stack_allocator = WithStackGuard::new(stack_allocator);
         let stack = match stack_allocator.allocate(STACK_LAYOUT) {
             Ok(stack) => stack.cast::<u8>(),
             Err(_) => {
@@ -1383,8 +1389,21 @@ impl<
             OUTCOME_TRAP => {
                 self.state = InstanceState::Idle;
                 let pc = unsafe { (*vmctx).trap_pc };
-                // TODO: when guard pages are restored, report `Trap::StackOverflow` if
-                // `fault_addr` is in the guard region of the stack
+
+                let fault_addr = unsafe { (*vmctx).trap_addr };
+                let stack_start = u64::try_from(self.stack.as_ptr().addr())
+                    .unwrap_or_else(|_| unreachable!());
+                let guard_start = stack_start
+                    - u64::try_from(alloc_stack_guard::guard_size(STACK_LAYOUT))
+                        .unwrap_or_else(|_| unreachable!());
+                // Signal number of `SIGSEGV` on x86-64 Linux.
+                if unsafe { (*vmctx).trap_signal } == 11
+                    && fault_addr >= guard_start
+                    && fault_addr < stack_start
+                {
+                    return Err(Error::Trap(Trap::StackOverflow));
+                }
+
                 let code_offset = usize::try_from(pc - module.code.as_ptr() as u64)
                     .unwrap_or_else(|_| unreachable!());
                 let trap = match module.traps.get(&code_offset) {

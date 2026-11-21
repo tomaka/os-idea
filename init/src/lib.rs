@@ -1,3 +1,4 @@
+mod alloc_stack_guard;
 mod executor;
 mod mmap_alloc;
 mod low_level_vm;
