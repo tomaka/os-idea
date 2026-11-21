@@ -1,6 +1,6 @@
+mod alloc_mmap;
 mod alloc_stack_guard;
 mod executor;
-mod mmap_alloc;
 mod low_level_vm;
 
 /// Configuration passed to [`run`].
@@ -77,14 +77,14 @@ pub fn run(config: Config) -> ! {
 
             // Check that an instance remains usable after a trap.
             let reuse_result =
-                low_level_vm::Builder::new(TEST_REUSE_WASM, mmap_alloc::Mmap::read_write_exec()).build();
+                low_level_vm::Builder::new(TEST_REUSE_WASM, alloc_mmap::Mmap::read_write_exec()).build();
             let reuse_result = reuse_result.and_then(|module| {
                 let mut instance =
                     low_level_vm::Instance::new(
                     &module,
                     &trap_handlers,
-                    mmap_alloc::Mmap::read_write(),
-                    mmap_alloc::Mmap::read_write(),
+                    alloc_mmap::Mmap::read_write(),
+                    alloc_mmap::Mmap::read_write(),
                 )?;
                 let first = instance.call("incr", &[]);
                 let trap = instance.call("trap", &[]);
@@ -159,7 +159,7 @@ fn run_wasm(
     trap_handlers: &low_level_vm::TrapHandlers,
     wasm_bytes: &[u8],
 ) -> Result<Vec<low_level_vm::Value>, low_level_vm::Error> {
-    let mut builder = low_level_vm::Builder::new(wasm_bytes, mmap_alloc::Mmap::read_write_exec());
+    let mut builder = low_level_vm::Builder::new(wasm_bytes, alloc_mmap::Mmap::read_write_exec());
     if wasm_bytes == TEST_IMPORTS_WASM {
         builder.register_import(|params| match params.get(0) {
             Some(low_level_vm::Value::I32(v)) => low_level_vm::Outcome::Resume(low_level_vm::Value::I32(v.wrapping_add(1))),
@@ -171,8 +171,8 @@ fn run_wasm(
     let mut instance = low_level_vm::Instance::new(
         &module,
         trap_handlers,
-        mmap_alloc::Mmap::read_write(),
-        mmap_alloc::Mmap::read_write(),
+        alloc_mmap::Mmap::read_write(),
+        alloc_mmap::Mmap::read_write(),
     )?;
     let mut outcome = instance.call("main", &[])?;
     loop {
