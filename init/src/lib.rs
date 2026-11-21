@@ -1,6 +1,6 @@
 mod executor;
 mod mmap_alloc;
-mod vm;
+mod low_level_vm;
 
 /// Configuration passed to [`run`].
 pub struct Config {
@@ -22,46 +22,46 @@ pub fn run(config: Config) -> ! {
     println!("Hello world");
 
     // SAFETY: nothing else in this program installs signal handlers.
-    match unsafe { vm::install_trap_handlers() } {
+    match unsafe { low_level_vm::install_trap_handlers() } {
         Ok(trap_handlers) => {
             for (name, wasm, expected) in [
-                ("general", TEST_WASM, Ok(vec![vm::Value::I32(42)])),
-                ("imports", TEST_IMPORTS_WASM, Ok(vec![vm::Value::I32(42)])),
-                ("memory grow", TEST_MEMORY_GROW_WASM, Ok(vec![vm::Value::I32(42)])),
+                ("general", TEST_WASM, Ok(vec![low_level_vm::Value::I32(42)])),
+                ("imports", TEST_IMPORTS_WASM, Ok(vec![low_level_vm::Value::I32(42)])),
+                ("memory grow", TEST_MEMORY_GROW_WASM, Ok(vec![low_level_vm::Value::I32(42)])),
                 (
                     "unreachable",
                     TEST_UNREACHABLE_WASM,
-                    Err(vm::Trap::Unreachable),
+                    Err(low_level_vm::Trap::Unreachable),
                 ),
                 (
                     "division by zero",
                     TEST_DIV_ZERO_WASM,
-                    Err(vm::Trap::DivisionByZero),
+                    Err(low_level_vm::Trap::DivisionByZero),
                 ),
                 (
                     "division overflow",
                     TEST_DIV_OVERFLOW_WASM,
-                    Err(vm::Trap::IntegerOverflow),
+                    Err(low_level_vm::Trap::IntegerOverflow),
                 ),
                 (
                     "remainder of overflow",
                     TEST_REM_OVERFLOW_WASM,
-                    Ok(vec![vm::Value::I32(0)]),
+                    Ok(vec![low_level_vm::Value::I32(0)]),
                 ),
                 (
                     "out of bounds",
                     TEST_OUT_OF_BOUNDS_WASM,
-                    Err(vm::Trap::OutOfBounds),
+                    Err(low_level_vm::Trap::OutOfBounds),
                 ),
                 (
                     "stack overflow",
                     TEST_STACK_OVERFLOW_WASM,
-                    Err(vm::Trap::StackOverflow),
+                    Err(low_level_vm::Trap::StackOverflow),
                 ),
             ] {
                 let result = match run_wasm(&trap_handlers, wasm) {
                     Ok(values) => Ok(values),
-                    Err(vm::Error::Trap(trap)) => Err(trap),
+                    Err(low_level_vm::Error::Trap(trap)) => Err(trap),
                     Err(err) => {
                         println!("Test {name}: FAIL: {err}");
                         continue;
@@ -76,10 +76,10 @@ pub fn run(config: Config) -> ! {
 
             // Check that an instance remains usable after a trap.
             let reuse_result =
-                vm::Builder::new(TEST_REUSE_WASM, mmap_alloc::Mmap::read_write_exec()).build();
+                low_level_vm::Builder::new(TEST_REUSE_WASM, mmap_alloc::Mmap::read_write_exec()).build();
             let reuse_result = reuse_result.and_then(|module| {
                 let mut instance =
-                    vm::Instance::new(
+                    low_level_vm::Instance::new(
                     &module,
                     &trap_handlers,
                     mmap_alloc::Mmap::read_write(),
@@ -92,10 +92,10 @@ pub fn run(config: Config) -> ! {
             });
             match reuse_result {
                 Ok((
-                    Ok(vm::RunOutcome::Return(first)),
-                    Err(vm::Error::Trap(vm::Trap::Unreachable)),
-                    Ok(vm::RunOutcome::Return(second)),
-                )) if first == [vm::Value::I32(1)] && second == [vm::Value::I32(3)] => {
+                    Ok(low_level_vm::RunOutcome::Return(first)),
+                    Err(low_level_vm::Error::Trap(low_level_vm::Trap::Unreachable)),
+                    Ok(low_level_vm::RunOutcome::Return(second)),
+                )) if first == [low_level_vm::Value::I32(1)] && second == [low_level_vm::Value::I32(3)] => {
                     println!("Test reuse after trap: OK");
                 }
                 other => println!("Test reuse after trap: FAIL: {other:?}"),
@@ -153,21 +153,21 @@ pub fn scan_available_programs_unordered() -> impl Iterator<Item = [u8; 32]> {
 ///
 /// The module must either have no import, or import `env.add_one` then `env.add_one_parked`.
 /// The former is answered directly by its callback, while the latter parks the execution and is
-/// answered through [`vm::Instance::resume`].
+/// answered through [`low_level_vm::Instance::resume`].
 fn run_wasm(
-    trap_handlers: &vm::TrapHandlers,
+    trap_handlers: &low_level_vm::TrapHandlers,
     wasm_bytes: &[u8],
-) -> Result<Vec<vm::Value>, vm::Error> {
-    let mut builder = vm::Builder::new(wasm_bytes, mmap_alloc::Mmap::read_write_exec());
+) -> Result<Vec<low_level_vm::Value>, low_level_vm::Error> {
+    let mut builder = low_level_vm::Builder::new(wasm_bytes, mmap_alloc::Mmap::read_write_exec());
     if wasm_bytes == TEST_IMPORTS_WASM {
         builder.register_import(|params| match params.get(0) {
-            Some(vm::Value::I32(v)) => vm::Outcome::Resume(vm::Value::I32(v.wrapping_add(1))),
+            Some(low_level_vm::Value::I32(v)) => low_level_vm::Outcome::Resume(low_level_vm::Value::I32(v.wrapping_add(1))),
             _ => unreachable!(),
         });
-        builder.register_import(|_| vm::Outcome::Park);
+        builder.register_import(|_| low_level_vm::Outcome::Park);
     }
     let module = builder.build()?;
-    let mut instance = vm::Instance::new(
+    let mut instance = low_level_vm::Instance::new(
         &module,
         trap_handlers,
         mmap_alloc::Mmap::read_write(),
@@ -176,14 +176,14 @@ fn run_wasm(
     let mut outcome = instance.call("main", &[])?;
     loop {
         match outcome {
-            vm::RunOutcome::Return(values) => return Ok(values),
-            vm::RunOutcome::ImportCall { import, args } => {
+            low_level_vm::RunOutcome::Return(values) => return Ok(values),
+            low_level_vm::RunOutcome::ImportCall { import, args } => {
                 let import = usize::try_from(import).unwrap_or_else(|_| unreachable!());
                 let result = match (module.imports_by_index().nth(import), args) {
-                    (Some(("env", "add_one_parked")), vm::Value::I32(v)) => {
-                        vm::Value::I32(v.wrapping_add(1))
+                    (Some(("env", "add_one_parked")), low_level_vm::Value::I32(v)) => {
+                        low_level_vm::Value::I32(v.wrapping_add(1))
                     }
-                    _ => return Err(vm::Error::Unsupported("unknown import")),
+                    _ => return Err(low_level_vm::Error::Unsupported("unknown import")),
                 };
                 outcome = instance.resume(result)?;
             }
