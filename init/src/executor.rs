@@ -1,13 +1,13 @@
 //! Collection of running Wasm instances.
 
-use alloc::{string::String, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::{alloc::Allocator, fmt, marker::PhantomData};
 
 use crate::low_level_vm;
 
 /// List of running Wasm instances, indexed by a 32 bytes identifier.
 pub struct Executor<
-    TModule: AsRef<low_level_vm::Module<TCodeAlloc, TCtxt>>,
+    TModule: AsRef<Module<TCodeAlloc, TCtxt>>,
     TCodeAlloc: Allocator,
     TCtxt,
     TStackAlloc: Allocator,
@@ -16,7 +16,7 @@ pub struct Executor<
     /// Running instances.
     instances: imbl::GenericHashMap<
         [u8; 32],
-        low_level_vm::Instance<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>,
+        InstanceRef<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>,
         fnv::FnvBuildHasher,
         imbl::shared_ptr::DefaultSharedPtr,
     >,
@@ -26,6 +26,45 @@ pub struct Executor<
     memory_allocator: TMemAlloc,
     /// Proof that the trap handlers are installed, necessary in order to create instances.
     trap_handlers: low_level_vm::TrapHandlers,
+}
+
+/// Shared reference to a running instance.
+pub struct InstanceRef<
+    TModule,
+    TCodeAlloc: Allocator,
+    TCtxt,
+    TStackAlloc: Allocator,
+    TMemAlloc: Allocator,
+> {
+    inner: Arc<InstanceRefInner>,
+}
+
+impl<
+    TModule,
+    TCodeAlloc: Allocator,
+    TCtxt,
+    TStackAlloc: Allocator,
+    TMemAlloc: Allocator,
+> Clone for InstanceRef<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>
+{
+    #[inline]
+    fn clone(&self) -> Self {
+        InstanceRef {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+struct InstanceRefInner {
+    /// If `Some`, the instance is ready to resume execution.
+    ready: atomicbox::AtomicOptionBox<
+        low_level_vm::Instance<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>,
+    >,
+    /// List of other instances that ready to deliver a request or notification to
+    /// the instance, and that are thus parked.
+    waiting_to_deliver: crossbeam_queue::SegQueue<
+        Box<low_level_vm::Instance<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>>,
+    >,
 }
 
 /// Prototype for an [`Executor`].
@@ -57,7 +96,7 @@ impl<TStackAlloc: Allocator, TMemAlloc: Allocator> ExecutorBuilder<TStackAlloc, 
     /// Builds the [`Executor`]. It initially doesn't contain any instance.
     #[inline]
     pub fn build<
-        TModule: AsRef<low_level_vm::Module<TCodeAlloc, TCtxt>>,
+        TModule: AsRef<Module<TCodeAlloc, TCtxt>>,
         TCodeAlloc: Allocator,
         TCtxt,
     >(
@@ -330,20 +369,32 @@ pub struct Module<TCodeAlloc: Allocator, TCtxt> {
 }
 
 /// Prototype for an instance of a [`Module`].
-pub struct InstanceBuilder<TModule, TCodeAlloc: Allocator, TCtxt> {
+pub struct InstanceBuilder<
+    TModule: AsRef<Module<TCodeAlloc, TCtxt>>,
+    TCodeAlloc: Allocator,
+    TCtxt,
+    TStackAlloc: Allocator,
+    TMemAlloc: Allocator,
+> {
     /// Module to instantiate.
     module: TModule,
     /// Private key of the instance.
     private_key: [u8; 32],
-    /// Public key of the program handling each interface used by the module, or `None` if not
-    /// set yet. Ordered the same way as [`Module::interfaces`].
-    interface_handlers: Vec<Option<[u8; 32]>>,
+    /// Program handling each interface used by the module, or `None` if not set yet. Ordered
+    /// the same way as [`Module::interfaces`].
+    interface_handlers:
+        Vec<Option<InstanceRef<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>>>,
     /// Marker for the `TCodeAlloc` and `TCtxt` generic parameters.
     marker: PhantomData<fn() -> (TCodeAlloc, TCtxt)>,
 }
 
-impl<TModule: AsRef<Module<TCodeAlloc, TCtxt>>, TCodeAlloc: Allocator, TCtxt>
-    InstanceBuilder<TModule, TCodeAlloc, TCtxt>
+impl<
+    TModule: AsRef<Module<TCodeAlloc, TCtxt>>,
+    TCodeAlloc: Allocator,
+    TCtxt,
+    TStackAlloc: Allocator,
+    TMemAlloc: Allocator,
+> InstanceBuilder<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>
 {
     /// Initializes a new builder for an instance of the given module.
     ///
@@ -351,17 +402,19 @@ impl<TModule: AsRef<Module<TCodeAlloc, TCtxt>>, TCodeAlloc: Allocator, TCtxt>
     ///
     /// Initially, no interface has a handler program.
     pub fn new(module: TModule, private_key: &[u8; 32]) -> Self {
-        let num_interfaces = module.as_ref().interfaces.len();
+        let num_interfaces = AsRef::<Module<TCodeAlloc, TCtxt>>::as_ref(&module)
+            .interfaces
+            .len();
         InstanceBuilder {
             module,
             private_key: *private_key,
-            interface_handlers: alloc::vec![None; num_interfaces],
+            interface_handlers: (0..num_interfaces).map(|_| None).collect::<Vec<_>>(),
             marker: PhantomData,
         }
     }
 
-    /// Sets the program, identified by its public key, that handles the messages that the
-    /// instance sends on the given interface. Overwrites any previously-set handler.
+    /// Sets the program that handles the messages that the instance sends on the given
+    /// interface. Overwrites any previously-set handler.
     ///
     /// # Panic
     ///
@@ -370,11 +423,14 @@ impl<TModule: AsRef<Module<TCodeAlloc, TCtxt>>, TCodeAlloc: Allocator, TCtxt>
     pub fn set_interface_handler_program(
         &mut self,
         interface: &[u8; 32],
-        handler_public_key: &[u8; 32],
+        handler_program: &InstanceRef<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>,
     ) {
-        let Ok(index) = self.module.as_ref().interfaces.binary_search(interface) else {
+        let Ok(index) = AsRef::<Module<TCodeAlloc, TCtxt>>::as_ref(&self.module)
+            .interfaces
+            .binary_search(interface)
+        else {
             panic!("interface not used by the module")
         };
-        self.interface_handlers[index] = Some(*handler_public_key);
+        self.interface_handlers[index] = Some(handler_program.clone());
     }
 }
