@@ -1,23 +1,22 @@
 //! Collection of running Wasm instances.
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, vec::Vec};
 use core::{alloc::Allocator, fmt, marker::PhantomData};
 
 use crate::low_level_vm;
 
 /// List of running Wasm instances, indexed by a 32 bytes identifier.
-pub struct Executor<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator> {
+pub struct Executor<
+    TModule: AsRef<low_level_vm::Module<TCodeAlloc, TCtxt>>,
+    TCodeAlloc: Allocator,
+    TCtxt,
+    TStackAlloc: Allocator,
+    TMemAlloc: Allocator,
+> {
     /// Running instances.
     instances: imbl::GenericHashMap<
         [u8; 32],
-        // TODO: `()` is a placeholder for the context of the instances
-        low_level_vm::Instance<
-            Arc<low_level_vm::Module<TCodeAlloc, ()>>,
-            TCodeAlloc,
-            (),
-            TStackAlloc,
-            TMemAlloc,
-        >,
+        low_level_vm::Instance<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>,
         fnv::FnvBuildHasher,
         imbl::shared_ptr::DefaultSharedPtr,
     >,
@@ -57,7 +56,13 @@ impl<TStackAlloc: Allocator, TMemAlloc: Allocator> ExecutorBuilder<TStackAlloc, 
 
     /// Builds the [`Executor`]. It initially doesn't contain any instance.
     #[inline]
-    pub fn build<TCodeAlloc: Allocator>(self) -> Executor<TCodeAlloc, TStackAlloc, TMemAlloc> {
+    pub fn build<
+        TModule: AsRef<low_level_vm::Module<TCodeAlloc, TCtxt>>,
+        TCodeAlloc: Allocator,
+        TCtxt,
+    >(
+        self,
+    ) -> Executor<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc> {
         Executor {
             instances: imbl::GenericHashMap::with_hasher(fnv::FnvBuildHasher::default()),
             stack_allocator: self.stack_allocator,
