@@ -187,38 +187,61 @@ unsafe extern "sysv64" {
     fn init_vm_sigreturn();
 }
 
-/// Called by the Wasm code in order to call an import, on the Wasm stack.
+/// Value returned by `init_vm_call_import`, in the `rax` and `rdx` registers.
+#[repr(C)]
+struct CallImportOutput {
+    /// Non-zero if the Wasm code must yield to the host by calling `init_vm_yield`.
+    must_yield: u64,
+    /// If `must_yield` is zero, the value returned by the import, zero-extended to 64 bits.
+    result: u64,
+}
+
+/// Called by the Wasm code in order to call the import whose index is `import`, on the Wasm
+/// stack. `param` is the parameter passed by the Wasm code, zero-extended to 64 bits.
 ///
-/// Calls the callback of the import whose index is in `import_idx`, with the parameter found
-/// in the values buffer. Returns `0` if the Wasm code can continue, in which case the result
-/// has been written to the values buffer, or `1` if the Wasm code must yield to the host.
+/// Calls the callback of the import and returns its result. If the callback parks the
+/// execution, the import index and the parameter are written to `import_idx` and the values
+/// buffer before returning, so that the host can find them after the Wasm code has yielded.
 ///
 /// Note that a panic in the callback aborts the process, as unwinding out of this function
 /// isn't possible.
-unsafe extern "sysv64" fn init_vm_call_import(vmctx: *mut VmCtx) -> u32 {
+unsafe extern "sysv64" fn init_vm_call_import(
+    vmctx: *mut VmCtx,
+    import: u32,
+    param: u64,
+) -> CallImportOutput {
     unsafe {
-        let import = (*vmctx).import_idx as usize;
-        let sig = &*(*vmctx).funcs.add(import);
-        // `values_len` is at least the number of parameters and results of every function.
+        let sig = &*(*vmctx).funcs.add(import as usize);
+        // `Builder::build` checks that all imports have exactly one parameter.
         let params = ParamsAccess {
-            values: slice::from_raw_parts((*vmctx).values, sig.params.len()),
+            values: slice::from_ref(&param),
             tys: &sig.params,
         };
-        match (*(*vmctx).import_callbacks.add(import))(params) {
-            Outcome::Resume(result) => {
-                // `Builder::build` checks that all imports have exactly one result.
-                let raw = match (result, sig.results[0]) {
-                    (Value::I32(v), types::I32) => u64::from(v as u32),
-                    (Value::I64(v), types::I64) => v as u64,
-                    _ => {
-                        (*vmctx).bad_import_result = true;
-                        return 1;
-                    }
+        let outcome = (*(*vmctx).import_callbacks.add(import as usize))(params);
+        // `Builder::build` checks that all imports have exactly one result.
+        let result = match (outcome, sig.results[0]) {
+            (Outcome::Resume(Value::I32(v)), types::I32) => u64::from(v as u32),
+            (Outcome::Resume(Value::I64(v)), types::I64) => v as u64,
+            (Outcome::Resume(_), _) => {
+                (*vmctx).bad_import_result = true;
+                return CallImportOutput {
+                    must_yield: 1,
+                    result: 0,
                 };
-                (*vmctx).values.write(raw);
-                0
             }
-            Outcome::Park => 1,
+            (Outcome::Park, _) => {
+                (*vmctx).import_idx = import;
+                // `values_len` is always at least 1.
+                (*vmctx).values.write(param);
+                return CallImportOutput {
+                    must_yield: 1,
+                    result: 0,
+                };
+            }
+        };
+        CallImportOutput {
+            must_yield: 0,
+            result,
         }
     }
 }
@@ -373,8 +396,8 @@ struct VmCtx {
     globals: *mut u64,
     /// Buffer used to pass parameters and results between the host and the Wasm code.
     values: *mut u64,
-    /// Index of the import being called, written by the Wasm code before calling
-    /// `init_vm_call_import`.
+    /// Index of the import whose callback has parked the execution, written by
+    /// `init_vm_call_import` before the Wasm code yields.
     import_idx: u32,
     /// Set to `true` by `init_vm_call_import` if the callback of an import has returned a
     /// value of the wrong type, in which case the Wasm code yields.
@@ -1364,7 +1387,10 @@ impl<'a> Translator<'a> {
         let mut yield_sig = Signature::new(CallConv::SystemV);
         yield_sig.params.push(AbiParam::new(types::I64));
         let mut call_import_sig = yield_sig.clone();
-        call_import_sig.returns.push(AbiParam::new(types::I32));
+        call_import_sig.params.push(AbiParam::new(types::I32));
+        call_import_sig.params.push(AbiParam::new(types::I64));
+        call_import_sig.returns.push(AbiParam::new(types::I64));
+        call_import_sig.returns.push(AbiParam::new(types::I64));
 
         let signature = builder.import_signature(yield_sig);
         let name = builder
@@ -1735,53 +1761,58 @@ impl<'a> Translator<'a> {
             Operator::Call { function_index }
                 if (function_index as usize) < self.num_imports =>
             {
-                // Calling an import consists in writing the parameters to the values buffer,
-                // then calling `init_vm_call_import`, which calls the callback of the import and
-                // writes the results to the values buffer. If `init_vm_call_import` returns a
-                // non-zero value, the Wasm code switches back to the host with `init_vm_yield`,
-                // and the host writes the results to the values buffer before resuming the
+                // Calling an import consists in calling `init_vm_call_import`, which calls the
+                // callback of the import and returns its result. If it indicates that the Wasm
+                // code must yield, the Wasm code switches back to the host with `init_vm_yield`,
+                // and the host writes the result to the values buffer before resuming the
                 // execution.
+                // `Builder::build` checks that all imports have exactly one parameter and one
+                // result.
                 let funcs = self.funcs;
-                let sig = &funcs[function_index as usize];
-                let values = self.vmctx_load(offset_of!(VmCtx, values));
-                let args = self.stack.split_off(self.stack.len() - sig.params.len());
-                for (i, arg) in args.into_iter().enumerate() {
-                    let arg = if self.builder.func.dfg.value_type(arg) == i64t {
-                        arg
-                    } else {
-                        self.builder.ins().uextend(i64t, arg)
-                    };
-                    self.builder
-                        .ins()
-                        .store(MemFlagsData::trusted(), arg, values, (i * 8) as i32);
-                }
+                let result_ty = funcs[function_index as usize].results[0];
+                let param = self.stack.pop().unwrap_or_else(|| unreachable!());
+                let param = if self.builder.func.dfg.value_type(param) == i64t {
+                    param
+                } else {
+                    self.builder.ins().uextend(i64t, param)
+                };
                 let import_idx = self.builder.ins().iconst(i32t, i64::from(function_index));
-                self.builder.ins().store(
-                    MemFlagsData::trusted(),
-                    import_idx,
-                    self.vmctx,
-                    offset_of!(VmCtx, import_idx) as i32,
-                );
-                let call = self.builder.ins().call(self.call_import_ref, &[self.vmctx]);
-                let must_yield = self.builder.inst_results(call)[0];
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.call_import_ref, &[self.vmctx, import_idx, param]);
+                let (must_yield, result) = match *self.builder.inst_results(call) {
+                    [must_yield, result] => (must_yield, result),
+                    _ => unreachable!(),
+                };
+
                 let yield_block = self.builder.create_block();
                 let continue_block = self.builder.create_block();
-                self.builder
-                    .ins()
-                    .brif(must_yield, yield_block, &[], continue_block, &[]);
+                let raw_result = self.builder.append_block_param(continue_block, i64t);
+                self.builder.ins().brif(
+                    must_yield,
+                    yield_block,
+                    &[],
+                    continue_block,
+                    &[BlockArg::Value(result)],
+                );
+
                 self.builder.switch_to_block(yield_block);
                 self.builder.ins().call(self.yield_ref, &[self.vmctx]);
-                self.builder.ins().jump(continue_block, &[]);
+                let values = self.vmctx_load(offset_of!(VmCtx, values));
+                let parked_result =
+                    self.builder.ins().load(i64t, MemFlagsData::trusted(), values, 0);
+                self.builder
+                    .ins()
+                    .jump(continue_block, &[BlockArg::Value(parked_result)]);
+
                 self.builder.switch_to_block(continue_block);
-                for (i, ty) in sig.results.iter().enumerate() {
-                    let v = self.builder.ins().load(
-                        *ty,
-                        MemFlagsData::trusted(),
-                        values,
-                        (i * 8) as i32,
-                    );
-                    self.stack.push(v);
-                }
+                let result = if result_ty == i64t {
+                    raw_result
+                } else {
+                    self.builder.ins().ireduce(result_ty, raw_result)
+                };
+                self.stack.push(result);
             }
             Operator::Call { function_index } => {
                 let funcs = self.funcs;
