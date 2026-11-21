@@ -1,7 +1,7 @@
 //! Collection of running Wasm instances.
 
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
-use core::{alloc::Allocator, fmt, marker::PhantomData};
+use core::{alloc::Allocator, fmt, marker::PhantomData, sync::atomic::Ordering};
 
 use crate::low_level_vm;
 
@@ -51,6 +51,41 @@ impl<
     fn clone(&self) -> Self {
         InstanceRef {
             inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<
+        TModule: AsRef<Module<TCodeAlloc, TCtxt>>,
+        TCodeAlloc: Allocator,
+        TCtxt,
+        TStackAlloc: Allocator,
+        TMemAlloc: Allocator,
+    > InstanceRef<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>
+{
+    /// Calls the `main` function exported by the instance, and runs it until it returns.
+    ///
+    /// Returns the values returned by the `main` function, or an error if the instance doesn't
+    /// export a `main` function that takes no parameter, or if the execution traps.
+    ///
+    /// The instance is no longer ready after this function returns.
+    ///
+    /// # Panic
+    ///
+    /// Panics if the instance isn't ready, for example because it is already running.
+    /// Panics if the instance calls an imported function that isn't handled natively, as this
+    /// isn't supported yet.
+    // TODO: don't expose low_level_vm::Error
+    pub fn start(&self) -> Result<Vec<low_level_vm::Value>, low_level_vm::Error> {
+        let Some(mut instance) = self.inner.ready.take(Ordering::AcqRel) else {
+            panic!("instance isn't ready")
+        };
+
+        match instance.call("main", &[])? {
+            low_level_vm::RunOutcome::Return(values) => Ok(values),
+            low_level_vm::RunOutcome::ImportCall { .. } => {
+                todo!("delivering messages to interface handlers")
+            }
         }
     }
 }
