@@ -6,7 +6,8 @@
 //!
 //! Supported subset:
 //!
-//! - Function imports only. No tables, no start function.
+//! - Function imports only, each with exactly one parameter and one result. No tables, no
+//!   start function.
 //! - Only `i32` and `i64` value types (no floats, no SIMD, no references).
 //! - Control flow (`block`, `loop`, `if`/`else`, `br`, `br_if`, `br_table`, `return`,
 //!   `unreachable`), direct calls, locals, globals, all integer arithmetic.
@@ -22,12 +23,17 @@
 //! Execution of the Wasm code switches back to the host stack when:
 //!
 //! - The called function returns.
-//! - The Wasm code calls an imported function. The host gets an [`Outcome::ImportCall`] and
-//!   can later continue the execution with [`Instance::resume`].
+//! - The Wasm code calls an imported function, and the callback registered with
+//!   [`Builder::register_import`] returns [`Outcome::Park`]. The host gets a
+//!   [`RunOutcome::ImportCall`] and can later continue the execution with [`Instance::resume`].
 //! - The Wasm code traps. Cranelift compiles traps into `ud2` instructions or relies on the
 //!   CPU raising an exception. The resulting `SIGILL`, `SIGFPE` or `SIGSEGV` is caught by a
 //!   signal handler (see [`install_trap_handlers`]) that redirects the execution to a routine
 //!   that abandons the Wasm stack and jumps back to the host stack.
+//!
+//! The callbacks registered with [`Builder::register_import`] are called directly by the Wasm
+//! code (through `init_vm_call_import`), on the Wasm stack and without any stack switch. If a
+//! callback returns [`Outcome::Resume`], the Wasm code continues immediately.
 //!
 //! The memory of the compiled code and of the native stacks is obtained from implementations
 //! of [`Allocator`] passed by the user.
@@ -42,6 +48,7 @@ use core::{
     fmt,
     mem::offset_of,
     ptr::{self, NonNull},
+    slice,
 };
 use std::collections::BTreeMap;
 
@@ -67,8 +74,8 @@ const WASM_PAGE_SIZE: u64 = 65536;
 const NAMESPACE_WASM_FUNC: u32 = 0;
 /// Namespace of the [`UserExternalName`]s that designate trampolines.
 const NAMESPACE_TRAMPOLINE: u32 = 1;
-/// Namespace of the [`UserExternalName`]s that designate routines of the host. The only
-/// routine is `init_vm_yield`, at index 0.
+/// Namespace of the [`UserExternalName`]s that designate routines of the host:
+/// `init_vm_yield` at index 0, and `init_vm_call_import` at index 1.
 const NAMESPACE_HOST: u32 = 2;
 
 /// Layout of the native stack of each instance.
@@ -170,12 +177,50 @@ global_asm!(
     trap = const OUTCOME_TRAP,
 );
 
+// The assembly code only accesses the fields of `VmCtx` that are FFI-safe.
+#[allow(improper_ctypes)]
 unsafe extern "sysv64" {
     fn init_vm_switch(save_rsp: *mut u64, new_rsp: u64, value: u64) -> u64;
     fn init_vm_fiber_start();
     fn init_vm_yield(vmctx: *mut VmCtx);
     fn init_vm_trap_landing(vmctx: *mut VmCtx);
     fn init_vm_sigreturn();
+}
+
+/// Called by the Wasm code in order to call an import, on the Wasm stack.
+///
+/// Calls the callback of the import whose index is in `import_idx`, with the parameter found
+/// in the values buffer. Returns `0` if the Wasm code can continue, in which case the result
+/// has been written to the values buffer, or `1` if the Wasm code must yield to the host.
+///
+/// Note that a panic in the callback aborts the process, as unwinding out of this function
+/// isn't possible.
+unsafe extern "sysv64" fn init_vm_call_import(vmctx: *mut VmCtx) -> u32 {
+    unsafe {
+        let import = (*vmctx).import_idx as usize;
+        let sig = &*(*vmctx).funcs.add(import);
+        // `values_len` is at least the number of parameters and results of every function.
+        let params = ParamsAccess {
+            values: slice::from_raw_parts((*vmctx).values, sig.params.len()),
+            tys: &sig.params,
+        };
+        match (*(*vmctx).import_callbacks.add(import))(params) {
+            Outcome::Resume(result) => {
+                // `Builder::build` checks that all imports have exactly one result.
+                let raw = match (result, sig.results[0]) {
+                    (Value::I32(v), types::I32) => u64::from(v as u32),
+                    (Value::I64(v), types::I64) => v as u64,
+                    _ => {
+                        (*vmctx).bad_import_result = true;
+                        return 1;
+                    }
+                };
+                (*vmctx).values.write(raw);
+                0
+            }
+            Outcome::Park => 1,
+        }
+    }
 }
 
 thread_local! {
@@ -205,9 +250,12 @@ pub enum Error {
     Allocation,
     /// The requested export doesn't exist or isn't a function.
     NoSuchExport,
-    /// The parameters passed to [`Instance::call`] or [`Instance::resume`] don't match the
-    /// function signature.
+    /// The parameters passed to [`Instance::call`] or [`Instance::resume`], or the values
+    /// returned through [`Outcome::Resume`], don't match the function signature.
     BadArgs,
+    /// The number of imports registered with [`Builder::register_import`] doesn't match the
+    /// number of imports of the Wasm module.
+    ImportsCountMismatch,
     /// [`Instance::resume`] was called while no execution is suspended.
     NotSuspended,
     /// Failed to install the signal handlers.
@@ -236,13 +284,60 @@ pub enum Trap {
 /// What happened to the execution of Wasm code after [`Instance::call`] or
 /// [`Instance::resume`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Outcome {
+pub enum RunOutcome {
     /// The called function has returned these values.
     Return(Vec<Value>),
-    /// The Wasm code is calling the imported function whose index is `import` (see
-    /// [`Module::imports_by_index`]) with the given arguments. Call [`Instance::resume`] with
-    /// the return values in order to continue the execution.
-    ImportCall { import: u32, args: Vec<Value> },
+    /// The Wasm code has called the imported function whose index is `import` (see
+    /// [`Module::imports_by_index`]) with the given argument, and the callback registered for
+    /// this import has returned [`Outcome::Park`]. Call [`Instance::resume`] with the return
+    /// value in order to continue the execution.
+    ImportCall { import: u32, args: Value },
+}
+
+/// Value returned by the callbacks registered with [`Builder::register_import`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// Continue the execution of the Wasm code immediately, with this value as return value of
+    /// the import.
+    Resume(Value),
+    /// Suspend the execution of the Wasm code. [`Instance::call`] or [`Instance::resume`]
+    /// returns a [`RunOutcome::ImportCall`].
+    Park,
+}
+
+/// Access to the parameters that the Wasm code has passed to an imported function.
+#[derive(Clone, Copy)]
+pub struct ParamsAccess<'a> {
+    /// Raw values of the parameters, as stored in the buffer shared with the Wasm code.
+    values: &'a [u64],
+    /// Types of the parameters. Has the same length as `values`.
+    tys: &'a [ir::Type],
+}
+
+impl ParamsAccess<'_> {
+    /// Returns the number of parameters.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Returns the parameter with the given index, or `None` if `index` is out of range.
+    pub fn get(&self, index: usize) -> Option<Value> {
+        let raw = *self.values.get(index)?;
+        if self.tys[index] == types::I32 {
+            Some(Value::I32(raw as u32 as i32))
+        } else {
+            Some(Value::I64(raw as i64))
+        }
+    }
+}
+
+impl fmt::Debug for ParamsAccess<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries((0..self.len()).filter_map(|index| self.get(index)))
+            .finish()
+    }
 }
 
 impl From<wasmparser::BinaryReaderError> for Error {
@@ -260,6 +355,9 @@ impl fmt::Display for Error {
             Error::Allocation => write!(f, "failed to allocate memory"),
             Error::NoSuchExport => write!(f, "no such exported function"),
             Error::BadArgs => write!(f, "arguments don't match the function signature"),
+            Error::ImportsCountMismatch => {
+                write!(f, "number of registered imports doesn't match the module")
+            }
             Error::NotSuspended => write!(f, "no execution is suspended"),
             Error::SignalHandlers => write!(f, "failed to install the signal handlers"),
             Error::Trap(trap) => write!(f, "Wasm trap: {trap:?}"),
@@ -275,8 +373,16 @@ struct VmCtx {
     globals: *mut u64,
     /// Buffer used to pass parameters and results between the host and the Wasm code.
     values: *mut u64,
-    /// Index of the import being called, written by the Wasm code before yielding.
+    /// Index of the import being called, written by the Wasm code before calling
+    /// `init_vm_call_import`.
     import_idx: u32,
+    /// Set to `true` by `init_vm_call_import` if the callback of an import has returned a
+    /// value of the wrong type, in which case the Wasm code yields.
+    bad_import_result: bool,
+    /// Signature of each function of the module, imported functions first.
+    funcs: *const FuncSig,
+    /// Callback of each imported function.
+    import_callbacks: *const fn(ParamsAccess<'_>) -> Outcome,
     /// Signal number of the latest trap, written by the signal handler.
     trap_signal: u32,
     /// Instruction pointer of the latest trap, written by the signal handler.
@@ -351,6 +457,8 @@ pub struct Module<TCodeAlloc: Allocator> {
     funcs: Vec<FuncSig>,
     /// Imported functions: (module name, field name).
     imports: Vec<(String, String)>,
+    /// Callback of each imported function, in the same order as `imports`.
+    import_callbacks: Vec<fn(ParamsAccess<'_>) -> Outcome>,
     /// Exported functions: name => (function index, offset of the trampoline in `code`).
     exports: BTreeMap<String, (u32, usize)>,
     /// Minimum number of pages of the memory, if any.
@@ -368,6 +476,8 @@ pub struct Module<TCodeAlloc: Allocator> {
 pub struct Builder<'a, TCodeAlloc: Allocator> {
     wasm: &'a [u8],
     code_allocator: TCodeAlloc,
+    /// Callbacks registered with [`Builder::register_import`], in order.
+    import_callbacks: Vec<fn(ParamsAccess<'_>) -> Outcome>,
 }
 
 impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
@@ -380,7 +490,23 @@ impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
         Builder {
             wasm,
             code_allocator,
+            import_callbacks: Vec::new(),
         }
+    }
+
+    /// Registers the callback of the next imported function.
+    ///
+    /// Imports must be registered in the same order as they are declared in the Wasm module,
+    /// and the number of registered imports must be equal to the number of imports of the Wasm
+    /// module, otherwise [`Builder::build`] returns [`Error::ImportsCountMismatch`].
+    ///
+    /// Whenever the Wasm code calls this import, `callback` is called with the parameter
+    /// passed by the Wasm code. See [`Outcome`].
+    ///
+    /// Only imported functions with exactly one parameter and one result are supported.
+    #[inline]
+    pub fn register_import(&mut self, callback: fn(ParamsAccess<'_>) -> Outcome) {
+        self.import_callbacks.push(callback);
     }
 
     /// Parses, validates and compiles the Wasm module.
@@ -388,6 +514,7 @@ impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
         let Builder {
             wasm,
             code_allocator,
+            import_callbacks,
         } = self;
 
         wasmparser::Validator::new().validate_all(wasm)?;
@@ -464,6 +591,13 @@ impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
                         let wasmparser::TypeRef::Func(ty) = import.ty else {
                             return Err(Error::Unsupported("non-function import"));
                         };
+                        // The type section always precedes the import section.
+                        let sig = &types[ty as usize];
+                        if sig.params.len() != 1 || sig.results.len() != 1 {
+                            return Err(Error::Unsupported(
+                                "import without exactly one parameter and one result",
+                            ));
+                        }
                         // Imports always precede the function section.
                         func_types.push(ty);
                         imports.push((String::from(import.module), String::from(import.name)));
@@ -476,6 +610,10 @@ impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
                 Payload::TagSection(_) => return Err(Error::Unsupported("exceptions")),
                 _ => {}
             }
+        }
+
+        if import_callbacks.len() != imports.len() {
+            return Err(Error::ImportsCountMismatch);
         }
 
         let funcs = func_types
@@ -541,6 +679,7 @@ impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
             code_allocator,
             funcs,
             imports,
+            import_callbacks,
             exports,
             memory_pages,
             globals,
@@ -727,6 +866,8 @@ impl Linker {
         for (offset, kind, target, addend) in self.relocs {
             let target_addr = if target == (NAMESPACE_HOST, 0) {
                 (init_vm_yield as *const ()).addr() as i64 + addend
+            } else if target == (NAMESPACE_HOST, 1) {
+                (init_vm_call_import as *const ()).addr() as i64 + addend
             } else {
                 (base + self.offsets[&target]) as i64 + addend
             };
@@ -972,6 +1113,9 @@ impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator> Instance<'m, TCodeAlloc,
             globals: globals.as_mut_ptr(),
             values: values.as_mut_ptr(),
             import_idx: 0,
+            bad_import_result: false,
+            funcs: module.funcs.as_ptr(),
+            import_callbacks: module.import_callbacks.as_ptr(),
             trap_signal: 0,
             trap_pc: 0,
             trap_addr: 0,
@@ -996,7 +1140,7 @@ impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator> Instance<'m, TCodeAlloc,
     /// Starts executing the exported function with the given name.
     ///
     /// If the execution of a previous call is suspended, it is discarded.
-    pub fn call(&mut self, export: &str, args: &[Value]) -> Result<Outcome, Error> {
+    pub fn call(&mut self, export: &str, args: &[Value]) -> Result<RunOutcome, Error> {
         let module = self.module;
         let (func_idx, offset) = *module.exports.get(export).ok_or(Error::NoSuchExport)?;
         self.write_values(&module.funcs[func_idx as usize].params, args)?;
@@ -1025,9 +1169,9 @@ impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator> Instance<'m, TCodeAlloc,
         self.run(func_idx)
     }
 
-    /// Resumes the execution suspended in a call to an import, passing the given return values
+    /// Resumes the execution suspended in a call to an import, passing the given return value
     /// of that import.
-    pub fn resume(&mut self, results: &[Value]) -> Result<Outcome, Error> {
+    pub fn resume(&mut self, result: Value) -> Result<RunOutcome, Error> {
         let InstanceState::Suspended {
             export_func,
             import,
@@ -1036,37 +1180,53 @@ impl<'m, TCodeAlloc: Allocator, TStackAlloc: Allocator> Instance<'m, TCodeAlloc,
             return Err(Error::NotSuspended);
         };
         let module = self.module;
-        self.write_values(&module.funcs[import as usize].results, results)?;
+        self.write_values(&module.funcs[import as usize].results, slice::from_ref(&result))?;
         self.run(export_func)
     }
 
     /// Switches to the Wasm stack, and returns when the execution of `export_func` finishes,
     /// gets suspended, or traps.
-    fn run(&mut self, export_func: u32) -> Result<Outcome, Error> {
+    fn run(&mut self, export_func: u32) -> Result<RunOutcome, Error> {
         let vmctx = self.vmctx;
+        let module = self.module;
+
         let previous = CURRENT_VMCTX.replace(vmctx);
         let outcome = unsafe {
             init_vm_switch(&raw mut (*vmctx).host_rsp, (*vmctx).wasm_rsp, 0)
         };
         CURRENT_VMCTX.set(previous);
 
-        let module = self.module;
         match outcome {
             OUTCOME_FINISHED => {
                 self.state = InstanceState::Idle;
-                Ok(Outcome::Return(
+                Ok(RunOutcome::Return(
                     self.read_values(&module.funcs[export_func as usize].results),
                 ))
             }
             OUTCOME_IMPORT => {
+                if unsafe { (*vmctx).bad_import_result } {
+                    // The execution can't continue, as the import has no valid return value.
+                    // Abandon it.
+                    unsafe { (*vmctx).bad_import_result = false };
+                    self.state = InstanceState::Idle;
+                    return Err(Error::BadArgs);
+                }
                 let import = unsafe { (*vmctx).import_idx };
+                let sig = &module.funcs[import as usize];
                 self.state = InstanceState::Suspended {
                     export_func,
                     import,
                 };
-                Ok(Outcome::ImportCall {
+                // `values_len` is at least the number of parameters and results of every
+                // function.
+                let params = ParamsAccess {
+                    values: unsafe { slice::from_raw_parts((*vmctx).values, sig.params.len()) },
+                    tys: &sig.params,
+                };
+                Ok(RunOutcome::ImportCall {
                     import,
-                    args: self.read_values(&module.funcs[import as usize].params),
+                    // `Builder::build` checks that all imports have exactly one parameter.
+                    args: params.get(0).unwrap_or_else(|| unreachable!()),
                 })
             }
             OUTCOME_TRAP => {
@@ -1181,8 +1341,10 @@ struct Translator<'a> {
     frames: Vec<Frame>,
     reachable: bool,
     func_refs: BTreeMap<u32, ir::FuncRef>,
-    /// Reference to `init_vm_yield`, if already declared.
-    yield_ref: Option<ir::FuncRef>,
+    /// Reference to `init_vm_yield`.
+    yield_ref: ir::FuncRef,
+    /// Reference to `init_vm_call_import`.
+    call_import_ref: ir::FuncRef,
 }
 
 impl<'a> Translator<'a> {
@@ -1199,6 +1361,33 @@ impl<'a> Translator<'a> {
         builder.switch_to_block(entry);
         let vmctx = builder.block_params(entry)[0];
 
+        let mut yield_sig = Signature::new(CallConv::SystemV);
+        yield_sig.params.push(AbiParam::new(types::I64));
+        let mut call_import_sig = yield_sig.clone();
+        call_import_sig.returns.push(AbiParam::new(types::I32));
+
+        let signature = builder.import_signature(yield_sig);
+        let name = builder
+            .func
+            .declare_imported_user_function(UserExternalName::new(NAMESPACE_HOST, 0));
+        let yield_ref = builder.import_function(ExtFuncData {
+            name: ExternalName::user(name),
+            signature,
+            colocated: false,
+            patchable: false,
+        });
+
+        let signature = builder.import_signature(call_import_sig);
+        let name = builder
+            .func
+            .declare_imported_user_function(UserExternalName::new(NAMESPACE_HOST, 1));
+        let call_import_ref = builder.import_function(ExtFuncData {
+            name: ExternalName::user(name),
+            signature,
+            colocated: false,
+            patchable: false,
+        });
+
         Translator {
             builder,
             types,
@@ -1212,7 +1401,8 @@ impl<'a> Translator<'a> {
             frames: Vec::new(),
             reachable: true,
             func_refs: BTreeMap::new(),
-            yield_ref: None,
+            yield_ref,
+            call_import_ref,
         }
     }
 
@@ -1546,8 +1736,11 @@ impl<'a> Translator<'a> {
                 if (function_index as usize) < self.num_imports =>
             {
                 // Calling an import consists in writing the parameters to the values buffer,
-                // then switching back to the host, which writes the results to the values
-                // buffer before resuming the execution.
+                // then calling `init_vm_call_import`, which calls the callback of the import and
+                // writes the results to the values buffer. If `init_vm_call_import` returns a
+                // non-zero value, the Wasm code switches back to the host with `init_vm_yield`,
+                // and the host writes the results to the values buffer before resuming the
+                // execution.
                 let funcs = self.funcs;
                 let sig = &funcs[function_index as usize];
                 let values = self.vmctx_load(offset_of!(VmCtx, values));
@@ -1569,26 +1762,17 @@ impl<'a> Translator<'a> {
                     self.vmctx,
                     offset_of!(VmCtx, import_idx) as i32,
                 );
-                let yield_ref = match self.yield_ref {
-                    Some(r) => r,
-                    None => {
-                        let mut yield_sig = Signature::new(CallConv::SystemV);
-                        yield_sig.params.push(AbiParam::new(i64t));
-                        let signature = self.builder.import_signature(yield_sig);
-                        let name = self.builder.func.declare_imported_user_function(
-                            UserExternalName::new(NAMESPACE_HOST, 0),
-                        );
-                        let r = self.builder.import_function(ExtFuncData {
-                            name: ExternalName::user(name),
-                            signature,
-                            colocated: false,
-                            patchable: false,
-                        });
-                        self.yield_ref = Some(r);
-                        r
-                    }
-                };
-                self.builder.ins().call(yield_ref, &[self.vmctx]);
+                let call = self.builder.ins().call(self.call_import_ref, &[self.vmctx]);
+                let must_yield = self.builder.inst_results(call)[0];
+                let yield_block = self.builder.create_block();
+                let continue_block = self.builder.create_block();
+                self.builder
+                    .ins()
+                    .brif(must_yield, yield_block, &[], continue_block, &[]);
+                self.builder.switch_to_block(yield_block);
+                self.builder.ins().call(self.yield_ref, &[self.vmctx]);
+                self.builder.ins().jump(continue_block, &[]);
+                self.builder.switch_to_block(continue_block);
                 for (i, ty) in sig.results.iter().enumerate() {
                     let v = self.builder.ins().load(
                         *ty,

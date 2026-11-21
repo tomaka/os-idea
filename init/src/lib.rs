@@ -86,9 +86,9 @@ pub fn run(config: Config) -> ! {
             });
             match reuse_result {
                 Ok((
-                    Ok(vm::Outcome::Return(first)),
+                    Ok(vm::RunOutcome::Return(first)),
                     Err(vm::Error::Trap(vm::Trap::Unreachable)),
-                    Ok(vm::Outcome::Return(second)),
+                    Ok(vm::RunOutcome::Return(second)),
                 )) if first == [vm::Value::I32(1)] && second == [vm::Value::I32(3)] => {
                     println!("Test reuse after trap: OK");
                 }
@@ -143,26 +143,38 @@ pub fn scan_available_programs_unordered() -> impl Iterator<Item = [u8; 32]> {
         })
 }
 
-/// Runs the `main` function of the given module, answering calls to the `env.add_one` import.
+/// Runs the `main` function of the given module.
+///
+/// The module must either have no import, or import `env.add_one` then `env.add_one_parked`.
+/// The former is answered directly by its callback, while the latter parks the execution and is
+/// answered through [`vm::Instance::resume`].
 fn run_wasm(
     trap_handlers: &vm::TrapHandlers,
     wasm_bytes: &[u8],
 ) -> Result<Vec<vm::Value>, vm::Error> {
-    let module = vm::Builder::new(wasm_bytes, mmap_alloc::Mmap::read_write_exec()).build()?;
+    let mut builder = vm::Builder::new(wasm_bytes, mmap_alloc::Mmap::read_write_exec());
+    if wasm_bytes == TEST_IMPORTS_WASM {
+        builder.register_import(|params| match params.get(0) {
+            Some(vm::Value::I32(v)) => vm::Outcome::Resume(vm::Value::I32(v.wrapping_add(1))),
+            _ => unreachable!(),
+        });
+        builder.register_import(|_| vm::Outcome::Park);
+    }
+    let module = builder.build()?;
     let mut instance = vm::Instance::new(&module, trap_handlers, mmap_alloc::Mmap::read_write())?;
     let mut outcome = instance.call("main", &[])?;
     loop {
         match outcome {
-            vm::Outcome::Return(values) => return Ok(values),
-            vm::Outcome::ImportCall { import, args } => {
+            vm::RunOutcome::Return(values) => return Ok(values),
+            vm::RunOutcome::ImportCall { import, args } => {
                 let import = usize::try_from(import).unwrap_or_else(|_| unreachable!());
-                let results = match (module.imports_by_index().nth(import), &args[..]) {
-                    (Some(("env", "add_one")), [vm::Value::I32(v)]) => {
-                        vec![vm::Value::I32(v.wrapping_add(1))]
+                let result = match (module.imports_by_index().nth(import), args) {
+                    (Some(("env", "add_one_parked")), vm::Value::I32(v)) => {
+                        vm::Value::I32(v.wrapping_add(1))
                     }
                     _ => return Err(vm::Error::Unsupported("unknown import")),
                 };
-                outcome = instance.resume(&results)?;
+                outcome = instance.resume(result)?;
             }
         }
     }
@@ -215,14 +227,16 @@ const TEST_WASM: &[u8] = &wat_to_wasm::wat_to_wasm!(
 "#
 );
 
-/// Calls an import three times, once from a nested function, while keeping a local alive
-/// across the calls. Returns 42.
+/// Calls imports three times, from a nested function and not, with an import that resumes the
+/// execution immediately and one that parks it, while keeping a local alive across the calls.
+/// Returns 42.
 const TEST_IMPORTS_WASM: &[u8] = &wat_to_wasm::wat_to_wasm!(
     r#"
 (module
   (import "env" "add_one" (func $add_one (param i32) (result i32)))
+  (import "env" "add_one_parked" (func $add_one_parked (param i32) (result i32)))
   (func $add_two (param i32) (result i32)
-    (call $add_one (call $add_one (local.get 0))))
+    (call $add_one_parked (call $add_one (local.get 0))))
   (func (export "main") (result i32) (local $x i32)
     (local.set $x (i32.const 1000))
     (i32.sub
