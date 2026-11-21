@@ -17,25 +17,99 @@ pub struct Config {
 
 /// Entry point of the init program. Runs the available programs and then pauses forever.
 pub fn run(config: Config) -> ! {
-    let available_programs =
-        scan_available_programs_unordered().collect::<hashbrown::HashSet<_, fnv::FnvBuildHasher>>();
+    // The programs are stored on the boot partition, which is mounted read-only at `/boot`.
+    // In order to find it, mount `sysfs` and `devtmpfs`, then look for the block device whose
+    // GPT partition name is `boot`.
+    for directory in ["/sys", "/boot"] {
+        match std::fs::create_dir(directory) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => println!("Failed to create {directory}: {err}"),
+        }
+    }
+    // SAFETY: all the parameters are valid NUL-terminated strings, and mounting these file
+    // systems doesn't affect the memory of this program.
+    if let Err(err) = unsafe {
+        syscalls::syscall!(
+            syscalls::Sysno::mount,
+            c"sysfs".as_ptr(),
+            c"/sys".as_ptr(),
+            c"sysfs".as_ptr(),
+            0usize,
+            0usize
+        )
+    } {
+        println!("Failed to mount /sys: {err}");
+    }
+    // SAFETY: see above.
+    if let Err(err) = unsafe {
+        syscalls::syscall!(
+            syscalls::Sysno::mount,
+            c"devtmpfs".as_ptr(),
+            c"/dev".as_ptr(),
+            c"devtmpfs".as_ptr(),
+            0usize,
+            0usize
+        )
+    } {
+        println!("Failed to mount /dev: {err}");
+    }
+    let boot_device = std::fs::read_dir("/sys/class/block")
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let uevent = std::fs::read_to_string(entry.ok()?.path().join("uevent")).ok()?;
+            if !uevent.lines().any(|line| line == "PARTNAME=boot") {
+                return None;
+            }
+            let device_name = uevent
+                .lines()
+                .find_map(|line| line.strip_prefix("DEVNAME="))?;
+            alloc::ffi::CString::new(format!("/dev/{device_name}")).ok()
+        })
+        .next();
+    match boot_device {
+        Some(boot_device) => {
+            // SAFETY: all the parameters are valid NUL-terminated strings, and mounting a file
+            // system doesn't affect the memory of this program.
+            if let Err(err) = unsafe {
+                syscalls::syscall!(
+                    syscalls::Sysno::mount,
+                    boot_device.as_ptr(),
+                    c"/boot".as_ptr(),
+                    c"vfat".as_ptr(),   // TODO: don't hardcode?
+                    1usize, // MS_RDONLY
+                    0usize
+                )
+            } {
+                println!("Failed to mount {boot_device:?} at /boot: {err}");
+            }
+        }
+        None => println!("Boot partition not found"),
+    }
+
+    let available_programs = scan_available_programs_unordered(std::path::Path::new("/boot"))
+        .collect::<hashbrown::HashSet<_, fnv::FnvBuildHasher>>();
 
     let secret_key = x25519_dalek::StaticSecret::from(config.secret_key);
 
     println!("Hello world");
 
     // SAFETY: nothing else in this program installs signal handlers.
-    let Ok(trap_handlers) = (unsafe { low_level_vm::install_trap_handlers() }) else {
-        println!("Failed to install the trap handlers: {err}");
-        // As PID 1, exiting would make the kernel panic. Pause forever instead.
-        loop {
-            std::thread::park();
+    let trap_handlers = match unsafe { low_level_vm::install_trap_handlers() } {
+        Ok(trap_handlers) => trap_handlers,
+        Err(err) => {
+            println!("Failed to install the trap handlers: {err}");
+            // As PID 1, exiting would make the kernel panic. Pause forever instead.
+            loop {
+                std::thread::park();
+            }
         }
     };
 
     // Execute each available program one after the other.
     for program in &available_programs {
-        let mut path = String::from("/");
+        let mut path = String::from("/boot/");
         for byte in program {
             path.push_str(&format!("{byte:02x}"));
         }
@@ -109,13 +183,15 @@ pub fn run(config: Config) -> ! {
     }
 }
 
-/// Scans the root directory `/` for files named `<hash>.wasm`, where `<hash>` is the lowercase
+/// Scans the given directory for files named `<hash>.wasm`, where `<hash>` is the lowercase
 /// hexadecimal representation of 32 bytes, and yields these 32 bytes in no particular order.
 ///
 /// Files whose name doesn't match this format are ignored. Errors while reading the directory or
 /// its entries are silently ignored as well.
-pub fn scan_available_programs_unordered() -> impl Iterator<Item = [u8; 32]> {
-    std::fs::read_dir("/")
+pub fn scan_available_programs_unordered(
+    directory: &std::path::Path,
+) -> impl Iterator<Item = [u8; 32]> {
+    std::fs::read_dir(directory)
         .into_iter()
         .flatten()
         .filter_map(|entry| {

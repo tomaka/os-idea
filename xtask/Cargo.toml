@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+blake3 = "1.8.7"
 bollard = { version = "0.21.0", default-features = false, features = ["pipe"] }
 cpio = "0.4.1"
 fatfs = "0.3.6"

@@ -3,6 +3,7 @@ use std::path::Path;
 mod build;
 mod build_init;
 mod build_kernel;
+mod build_wasm_programs;
 mod disk_image;
 
 fn main() {

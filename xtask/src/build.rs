@@ -1,4 +1,4 @@
-use crate::{build_init, build_kernel};
+use crate::{build_init, build_kernel, build_wasm_programs};
 use core::iter;
 use std::path::{Path, PathBuf};
 
@@ -14,16 +14,17 @@ pub struct BuildOutput {
 
 interface_bindings::interface_bindings_definitions_only!("../interfaces/executor.cddl");
 
-/// Builds the kernel and the init ramdisk.
+/// Builds the kernel, the init ramdisk, and the Wasm programs.
 ///
 /// # Panic
 ///
-/// Panics if building the kernel fails.
+/// Panics if building the kernel or the Wasm programs fails.
 pub fn build(project_root: &Path) -> BuildOutput {
     let init_secret_key = x25519_dalek::StaticSecret::from(rand::random::<[u8; 32]>());
     let init_public_key = x25519_dalek::PublicKey::from(&init_secret_key);
 
     let bzimage = build_kernel::build_kernel(project_root).unwrap();
+    let wasm_programs = build_wasm_programs::build_wasm_programs_unordered(project_root);
 
     let messages = iter::once(executor::StartRequest(
         [0; 32],
@@ -41,6 +42,6 @@ pub fn build(project_root: &Path) -> BuildOutput {
     BuildOutput {
         bzimage,
         init,
-        wasm_programs: Vec::new(), // TODO:
+        wasm_programs,
     }
 }
