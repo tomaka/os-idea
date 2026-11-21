@@ -30,13 +30,13 @@ pub struct Executor<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Al
 }
 
 /// Prototype for an [`Executor`].
-pub struct Builder<TStackAlloc: Allocator, TMemAlloc: Allocator> {
+pub struct ExecutorBuilder<TStackAlloc: Allocator, TMemAlloc: Allocator> {
     stack_allocator: TStackAlloc,
     memory_allocator: TMemAlloc,
     trap_handlers: low_level_vm::TrapHandlers,
 }
 
-impl<TStackAlloc: Allocator, TMemAlloc: Allocator> Builder<TStackAlloc, TMemAlloc> {
+impl<TStackAlloc: Allocator, TMemAlloc: Allocator> ExecutorBuilder<TStackAlloc, TMemAlloc> {
     /// Initializes a new builder.
     ///
     /// The native stacks of the instances are allocated with `stack_allocator`, and their linear
@@ -48,7 +48,7 @@ impl<TStackAlloc: Allocator, TMemAlloc: Allocator> Builder<TStackAlloc, TMemAllo
         memory_allocator: TMemAlloc,
         trap_handlers: low_level_vm::TrapHandlers,
     ) -> Self {
-        Builder {
+        ExecutorBuilder {
             stack_allocator,
             memory_allocator,
             trap_handlers,
@@ -65,16 +65,6 @@ impl<TStackAlloc: Allocator, TMemAlloc: Allocator> Builder<TStackAlloc, TMemAllo
             trap_handlers: self.trap_handlers,
         }
     }
-}
-
-/// List of compiled Wasm modules, indexed by a 32 bytes identifier.
-pub struct ModulesRegistry<TCodeAlloc: Allocator> {
-    // TODO: `()` is a placeholder for the context of the instances
-    modules: hashbrown::HashMap<
-        [u8; 32],
-        Arc<low_level_vm::Module<TCodeAlloc, ()>>,
-        fnv::FnvBuildHasher,
-    >,
 }
 
 /// Prototype for a [`Module`].
