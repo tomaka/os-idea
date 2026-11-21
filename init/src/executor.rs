@@ -199,10 +199,11 @@ pub struct MessageAccess<'a> {
 }
 
 impl MessageAccess<'_> {
-    /// Returns the parameter that the Wasm code has passed to the imported function.
-    pub fn raw_param(&self) -> low_level_vm::Value {
-        // `low_level_vm::Builder::build` checks that all imports have exactly one parameter.
-        self.inner.get(0).unwrap_or_else(|| unreachable!())
+    /// Returns the parameter with the given index that the Wasm code has passed to the
+    /// imported function, or `None` if `index` is out of range.
+    #[inline]
+    pub fn raw_param(&self, index: usize) -> Option<low_level_vm::Value> {
+        self.inner.get(index)
     }
 }
 
@@ -217,8 +218,8 @@ impl fmt::Debug for MessageAccess<'_> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// Continue the execution of the Wasm code immediately, with this value as return value of
-    /// the imported function.
-    Resume(low_level_vm::Value),
+    /// the imported function. Must be `None` if the imported function has no result.
+    Resume(Option<low_level_vm::Value>),
     /// Suspend the execution of the Wasm code, as if the interface wasn't handled natively.
     Park,
 }

@@ -6,7 +6,7 @@
 //!
 //! Supported subset:
 //!
-//! - Function imports only, each with exactly one parameter and one result. No start function.
+//! - Function imports only, each with at most one result. No start function.
 //! - Only `i32` and `i64` value types (no floats, no SIMD, no references).
 //! - Control flow (`block`, `loop`, `if`/`else`, `br`, `br_if`, `br_table`, `return`,
 //!   `unreachable`), direct and indirect calls, locals, globals, all integer arithmetic.
@@ -206,11 +206,13 @@ struct CallImportOutput {
 }
 
 /// Called by the Wasm code in order to call the import whose index is `import`, on the Wasm
-/// stack. `param` is the parameter passed by the Wasm code, zero-extended to 64 bits.
+/// stack. Before calling this function, the Wasm code writes the parameters of the import to
+/// the values buffer.
 ///
 /// Calls the callback of the import and returns its result. If the callback parks the
-/// execution, the import index and the parameter are written to `import_idx` and the values
-/// buffer before returning, so that the host can find them after the Wasm code has yielded.
+/// execution, the import index is written to `import_idx` before returning, so that the host
+/// can find it, alongside the parameters still in the values buffer, after the Wasm code has
+/// yielded.
 ///
 /// `TCtxt` must be the type of the context that `ctxt` points to, and `import_callbacks` must
 /// point to callbacks taking this context.
@@ -220,13 +222,12 @@ struct CallImportOutput {
 unsafe extern "sysv64" fn init_vm_call_import<TCtxt>(
     vmctx: *mut VmCtx,
     import: u32,
-    param: u64,
 ) -> CallImportOutput {
     unsafe {
         let sig = &*(*vmctx).funcs.add(import as usize);
-        // `Builder::build` checks that all imports have exactly one parameter.
+        // `values_len` is at least the number of parameters and results of every function.
         let params = ParamsAccess {
-            values: slice::from_ref(&param),
+            values: slice::from_raw_parts((*vmctx).values, sig.params.len()),
             tys: &sig.params,
         };
         let callbacks = (*vmctx)
@@ -236,10 +237,11 @@ unsafe extern "sysv64" fn init_vm_call_import<TCtxt>(
         // `Instance::resume` take `&mut self`.
         let ctxt = &mut *(*vmctx).ctxt.cast::<TCtxt>();
         let outcome = (*callbacks.add(import as usize))(ctxt, params);
-        // `Builder::build` checks that all imports have exactly one result.
-        let result = match (outcome, sig.results[0]) {
-            (Outcome::Resume(Value::I32(v)), types::I32) => u64::from(v as u32),
-            (Outcome::Resume(Value::I64(v)), types::I64) => v as u64,
+        // `Builder::build` checks that all imports have at most one result.
+        let result = match (outcome, sig.results.first().copied()) {
+            (Outcome::Resume(None), None) => 0,
+            (Outcome::Resume(Some(Value::I32(v))), Some(types::I32)) => u64::from(v as u32),
+            (Outcome::Resume(Some(Value::I64(v))), Some(types::I64)) => v as u64,
             (Outcome::Resume(_), _) => {
                 (*vmctx).bad_import_result = true;
                 return CallImportOutput {
@@ -249,8 +251,6 @@ unsafe extern "sysv64" fn init_vm_call_import<TCtxt>(
             }
             (Outcome::Park, _) => {
                 (*vmctx).import_idx = import;
-                // `values_len` is always at least 1.
-                (*vmctx).values.write(param);
                 return CallImportOutput {
                     must_yield: 1,
                     result: 0,
@@ -390,18 +390,18 @@ pub enum RunOutcome {
     /// The called function has returned these values.
     Return(Vec<Value>),
     /// The Wasm code has called the imported function whose index is `import` (see
-    /// [`Module::imports_by_index`]) with the given argument, and the callback registered for
+    /// [`Module::imports_by_index`]) with the given arguments, and the callback registered for
     /// this import has returned [`Outcome::Park`]. Call [`Instance::resume`] with the return
     /// value in order to continue the execution.
-    ImportCall { import: u32, args: Value },
+    ImportCall { import: u32, args: Vec<Value> },
 }
 
 /// Value returned by the callbacks registered with [`Builder::register_import`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// Continue the execution of the Wasm code immediately, with this value as return value of
-    /// the import.
-    Resume(Value),
+    /// the import. Must be `None` if the import has no result.
+    Resume(Option<Value>),
     /// Suspend the execution of the Wasm code. [`Instance::call`] or [`Instance::resume`]
     /// returns a [`RunOutcome::ImportCall`].
     Park,
@@ -658,10 +658,10 @@ impl<'a, TCodeAlloc: Allocator, TCtxt> Builder<'a, TCodeAlloc, TCtxt> {
     /// module, otherwise [`Builder::build`] returns [`Error::ImportsCountMismatch`].
     ///
     /// Whenever the Wasm code calls this import, `callback` is called with the context of the
-    /// [`Instance`] (see [`Instance::new`]) and the parameter passed by the Wasm code. See
+    /// [`Instance`] (see [`Instance::new`]) and the parameters passed by the Wasm code. See
     /// [`Outcome`].
     ///
-    /// Only imported functions with exactly one parameter and one result are supported.
+    /// Only imported functions with at most one result are supported.
     ///
     /// # Constraints on the callback
     ///
@@ -680,8 +680,8 @@ impl<'a, TCodeAlloc: Allocator, TCtxt> Builder<'a, TCodeAlloc, TCtxt> {
     /// - If the callback blocks, the execution of the Wasm code and the thread are blocked as
     ///   well. Use [`Outcome::Park`] to give control back to the host instead.
     ///
-    /// The value passed to [`Outcome::Resume`] must have the type of the result of the import.
-    /// Otherwise, the execution is abandoned and [`Instance::call`] or [`Instance::resume`]
+    /// The value passed to [`Outcome::Resume`] must have the type of the result of the import,
+    /// or be `None` if the import has no result. Otherwise, the execution is abandoned and [`Instance::call`] or [`Instance::resume`]
     /// returns [`Error::BadArgs`].
     #[inline]
     pub fn register_import(
@@ -781,10 +781,8 @@ impl<'a, TCodeAlloc: Allocator, TCtxt> Builder<'a, TCodeAlloc, TCtxt> {
                         };
                         // The type section always precedes the import section.
                         let sig = &types[ty as usize];
-                        if sig.params.len() != 1 || sig.results.len() != 1 {
-                            return Err(Error::Unsupported(
-                                "import without exactly one parameter and one result",
-                            ));
+                        if sig.results.len() > 1 {
+                            return Err(Error::Unsupported("import with more than one result"));
                         }
                         // Imports always precede the function section.
                         func_types.push(ty);
@@ -960,9 +958,8 @@ impl<'a, TCodeAlloc: Allocator, TCtxt> Builder<'a, TCodeAlloc, TCtxt> {
                 translator.builder.finalize(isa.frontend_config());
                 (NAMESPACE_WASM_FUNC, func_idx as u32)
             } else if let Some(&import_idx) = wrapped_imports.get(item_idx - bodies.len()) {
-                // The wrapper simply passes its parameter to the import and returns its result.
-                // `Builder::build` checks that all imports have exactly one parameter and one
-                // result.
+                // The wrapper simply passes its parameters to the import and returns its
+                // result, if any.
                 let func_idx = import_idx as usize;
                 ctx.func.signature = funcs[func_idx].to_clif();
                 let builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
@@ -979,13 +976,13 @@ impl<'a, TCodeAlloc: Allocator, TCtxt> Builder<'a, TCodeAlloc, TCtxt> {
                     .builder
                     .current_block()
                     .unwrap_or_else(|| unreachable!());
-                let param = translator.builder.block_params(entry)[1];
-                translator.stack.push(param);
+                let params = translator.builder.block_params(entry)[1..].to_vec();
+                translator.stack.extend(params);
                 translator.translate_op(Operator::Call {
                     function_index: import_idx,
                 })?;
-                let result = translator.stack.pop().unwrap_or_else(|| unreachable!());
-                translator.builder.ins().return_(&[result]);
+                let results = translator.stack.clone();
+                translator.builder.ins().return_(&results);
                 translator.builder.seal_all_blocks();
                 translator.builder.finalize(isa.frontend_config());
                 (NAMESPACE_WASM_FUNC, import_idx)
@@ -1592,8 +1589,8 @@ impl<
     }
 
     /// Resumes the execution suspended in a call to an import, passing the given return value
-    /// of that import.
-    pub fn resume(&mut self, result: Value) -> Result<RunOutcome, Error> {
+    /// of that import. `result` must be `None` if the import has no result.
+    pub fn resume(&mut self, result: Option<Value>) -> Result<RunOutcome, Error> {
         let InstanceState::Suspended {
             export_func,
             import,
@@ -1602,10 +1599,7 @@ impl<
             return Err(Error::NotSuspended);
         };
         let module = self.module.as_ref();
-        self.write_values(
-            &module.funcs[import as usize].results,
-            slice::from_ref(&result),
-        )?;
+        self.write_values(&module.funcs[import as usize].results, result.as_slice())?;
         self.run(export_func)
     }
 
@@ -1635,21 +1629,13 @@ impl<
                     return Err(Error::BadArgs);
                 }
                 let import = unsafe { (*vmctx).import_idx };
-                let sig = &module.funcs[import as usize];
                 self.state = InstanceState::Suspended {
                     export_func,
                     import,
                 };
-                // `values_len` is at least the number of parameters and results of every
-                // function.
-                let params = ParamsAccess {
-                    values: unsafe { slice::from_raw_parts((*vmctx).values, sig.params.len()) },
-                    tys: &sig.params,
-                };
                 Ok(RunOutcome::ImportCall {
                     import,
-                    // `Builder::build` checks that all imports have exactly one parameter.
-                    args: params.get(0).unwrap_or_else(|| unreachable!()),
+                    args: self.read_values(&module.funcs[import as usize].params),
                 })
             }
             OUTCOME_TRAP => {
@@ -1823,7 +1809,6 @@ impl<'a> Translator<'a> {
         yield_sig.params.push(AbiParam::new(types::I64));
         let mut call_import_sig = yield_sig.clone();
         call_import_sig.params.push(AbiParam::new(types::I32));
-        call_import_sig.params.push(AbiParam::new(types::I64));
         call_import_sig.returns.push(AbiParam::new(types::I64));
         call_import_sig.returns.push(AbiParam::new(types::I64));
 
@@ -2198,26 +2183,37 @@ impl<'a> Translator<'a> {
                 self.reachable = false;
             }
             Operator::Call { function_index } if (function_index as usize) < self.num_imports => {
-                // Calling an import consists in calling `init_vm_call_import`, which calls the
-                // callback of the import and returns its result. If it indicates that the Wasm
-                // code must yield, the Wasm code switches back to the host with `init_vm_yield`,
-                // and the host writes the result to the values buffer before resuming the
-                // execution.
-                // `Builder::build` checks that all imports have exactly one parameter and one
-                // result.
+                // Calling an import consists in writing its parameters to the values buffer,
+                // then calling `init_vm_call_import`, which calls the callback of the import and
+                // returns its result. If it indicates that the Wasm code must yield, the Wasm
+                // code switches back to the host with `init_vm_yield`, and the host writes the
+                // result to the values buffer before resuming the execution.
+                // `Builder::build` checks that all imports have at most one result.
                 let funcs = self.funcs;
-                let result_ty = funcs[function_index as usize].results[0];
-                let param = self.stack.pop().unwrap_or_else(|| unreachable!());
-                let param = if self.builder.func.dfg.value_type(param) == i64t {
-                    param
-                } else {
-                    self.builder.ins().uextend(i64t, param)
-                };
+                let sig = &funcs[function_index as usize];
+                let result_ty = sig.results.first().copied();
+                let params = self
+                    .stack
+                    .drain(self.stack.len() - sig.params.len()..)
+                    .collect::<Vec<_>>();
+                if !params.is_empty() {
+                    let values = self.vmctx_load(offset_of!(VmCtx, values));
+                    for (i, param) in params.into_iter().enumerate() {
+                        // `values_len` is at least the number of parameters and results of
+                        // every function.
+                        self.builder.ins().store(
+                            MemFlagsData::trusted(),
+                            param,
+                            values,
+                            (i * 8) as i32,
+                        );
+                    }
+                }
                 let import_idx = self.builder.ins().iconst(i32t, i64::from(function_index));
                 let call = self
                     .builder
                     .ins()
-                    .call(self.call_import_ref, &[self.vmctx, import_idx, param]);
+                    .call(self.call_import_ref, &[self.vmctx, import_idx]);
                 let (must_yield, result) = match *self.builder.inst_results(call) {
                     [must_yield, result] => (must_yield, result),
                     _ => unreachable!(),
@@ -2246,12 +2242,14 @@ impl<'a> Translator<'a> {
                     .jump(continue_block, &[BlockArg::Value(parked_result)]);
 
                 self.builder.switch_to_block(continue_block);
-                let result = if result_ty == i64t {
-                    raw_result
-                } else {
-                    self.builder.ins().ireduce(result_ty, raw_result)
-                };
-                self.stack.push(result);
+                match result_ty {
+                    Some(ty) if ty == i64t => self.stack.push(raw_result),
+                    Some(ty) => {
+                        let result = self.builder.ins().ireduce(ty, raw_result);
+                        self.stack.push(result);
+                    }
+                    None => {}
+                }
             }
             Operator::Call { function_index } => {
                 let funcs = self.funcs;
