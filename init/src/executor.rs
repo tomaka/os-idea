@@ -81,10 +81,23 @@ impl<
             panic!("instance isn't ready")
         };
 
-        match instance.call("main", &[])? {
-            low_level_vm::RunOutcome::Return(values) => Ok(values),
-            low_level_vm::RunOutcome::ImportCall { .. } => {
+        let mut outcome = instance.vm.call("main", &[])?;
+        loop {
+            let (import, args) = match outcome {
+                low_level_vm::RunOutcome::Return(values) => return Ok(values),
+                low_level_vm::RunOutcome::ImportCall { import, args } => (import, args),
+            };
+
+            // `import` is always a valid import index.
+            let native_handler = instance.vm.module().0.as_ref().native_handlers
+                [usize::try_from(import).unwrap_or_else(|_| unreachable!())];
+            let Some(native_handler) = native_handler else {
                 todo!("delivering messages to interface handlers")
+            };
+
+            match native_handler(&mut instance.ctxt, MessageAccess { args: &args }) {
+                Outcome::Resume(value) => outcome = instance.vm.resume(value)?,
+                Outcome::Park => todo!("delivering messages to interface handlers"),
             }
         }
     }
@@ -105,33 +118,39 @@ struct InstanceRefInner<
         Vec<Option<InstanceRef<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>>>,
     /// If `Some`, the instance is ready to resume execution.
     ready: atomicbox::AtomicOptionBox<
-        low_level_vm::Instance<InstanceModule<TModule>, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>,
+        RunningInstance<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>,
     >,
     /// List of other instances that ready to deliver a request or notification to
     /// the instance, and that are thus parked.
     waiting_to_deliver: crossbeam_queue::SegQueue<
-        Box<
-            low_level_vm::Instance<
-                InstanceModule<TModule>,
-                TCodeAlloc,
-                TCtxt,
-                TStackAlloc,
-                TMemAlloc,
-            >,
-        >,
+        Box<RunningInstance<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>>,
     >,
+}
+
+/// Low-level instance alongside its context.
+struct RunningInstance<
+    TModule: AsRef<Module<TCodeAlloc, TCtxt>>,
+    TCodeAlloc: Allocator,
+    TCtxt,
+    TStackAlloc: Allocator,
+    TMemAlloc: Allocator,
+> {
+    /// The low-level instance.
+    vm: low_level_vm::Instance<InstanceModule<TModule, TCtxt>, TCodeAlloc, TStackAlloc, TMemAlloc>,
+    /// Context passed to the native interface handlers of the instance.
+    ctxt: TCtxt,
 }
 
 /// Wraps around a `TModule` implementing `AsRef<Module>`, and implements
 /// `AsRef<low_level_vm::Module>`, so that it can be passed to [`low_level_vm::Instance::new`].
 // FIXME: remove
-struct InstanceModule<TModule>(TModule);
+struct InstanceModule<TModule, TCtxt>(TModule, PhantomData<fn() -> TCtxt>);
 
 impl<TModule: AsRef<Module<TCodeAlloc, TCtxt>>, TCodeAlloc: Allocator, TCtxt>
-    AsRef<low_level_vm::Module<TCodeAlloc, TCtxt>> for InstanceModule<TModule>
+    AsRef<low_level_vm::Module<TCodeAlloc>> for InstanceModule<TModule, TCtxt>
 {
     #[inline]
-    fn as_ref(&self) -> &low_level_vm::Module<TCodeAlloc, TCtxt> {
+    fn as_ref(&self) -> &low_level_vm::Module<TCodeAlloc> {
         &self.0.as_ref().inner
     }
 }
@@ -185,8 +204,8 @@ pub struct ModuleBuilder<'a, TCtxt> {
     wasm: &'a [u8],
     /// Imported functions of the module, ordered by import index.
     imports: Vec<ModuleImport>,
-    /// Native handler of each imported function, or `None` if the import parks the execution.
-    /// Ordered the same way as `imports`.
+    /// Native handler of each imported function, or `None` if not set. Ordered the same way as
+    /// `imports`.
     native_handlers: Vec<Option<fn(&mut TCtxt, MessageAccess<'_>) -> Outcome>>,
 }
 
@@ -195,7 +214,7 @@ pub struct ModuleBuilder<'a, TCtxt> {
 #[derive(Clone, Copy)]
 pub struct MessageAccess<'a> {
     /// Parameters passed by the Wasm code to the imported function.
-    inner: low_level_vm::ParamsAccess<'a>,
+    args: &'a [low_level_vm::Value],
 }
 
 impl MessageAccess<'_> {
@@ -203,14 +222,14 @@ impl MessageAccess<'_> {
     /// imported function, or `None` if `index` is out of range.
     #[inline]
     pub fn raw_param(&self, index: usize) -> Option<low_level_vm::Value> {
-        self.inner.get(index)
+        self.args.get(index).copied()
     }
 }
 
 impl fmt::Debug for MessageAccess<'_> {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.inner, f)
+        fmt::Debug::fmt(self.args, f)
     }
 }
 
@@ -354,13 +373,10 @@ impl<'a, TCtxt> ModuleBuilder<'a, TCtxt> {
     }
 
     /// Makes the `request` and `notification` imported functions of the given interface call
-    /// `handler` directly, instead of parking the execution. Overwrites any previously-set
-    /// handler for this interface.
+    /// `handler` on the host, instead of delivering the message to the handler program of the
+    /// interface. Overwrites any previously-set handler for this interface.
     ///
     /// Has no effect if the module doesn't use this interface.
-    ///
-    /// `handler` is called directly by the compiled Wasm code. See
-    /// [`low_level_vm::Builder::register_import`] for the constraints that apply to it.
     pub fn set_interface_as_native(
         &mut self,
         interface: [u8; 32],
@@ -386,22 +402,8 @@ impl<'a, TCtxt> ModuleBuilder<'a, TCtxt> {
     pub fn build<TCodeAlloc: Allocator>(
         self,
         code_allocator: TCodeAlloc,
-    ) -> Result<Module<TCodeAlloc, TCtxt>, low_level_vm::Error>
-    where
-        TCtxt: 'static,
-    {
-        let mut builder = low_level_vm::Builder::new(self.wasm, code_allocator);
-        for native_handler in self.native_handlers {
-            match native_handler {
-                Some(handler) => builder.register_import(move |ctxt, params| {
-                    match handler(ctxt, MessageAccess { inner: params }) {
-                        Outcome::Resume(value) => low_level_vm::Outcome::Resume(value),
-                        Outcome::Park => low_level_vm::Outcome::Park,
-                    }
-                }),
-                None => builder.register_import(|_, _| low_level_vm::Outcome::Park),
-            }
-        }
+    ) -> Result<Module<TCodeAlloc, TCtxt>, low_level_vm::Error> {
+        let builder = low_level_vm::Builder::new(self.wasm, code_allocator);
 
         let mut interfaces =
             self.imports
@@ -417,6 +419,7 @@ impl<'a, TCtxt> ModuleBuilder<'a, TCtxt> {
         Ok(Module {
             inner: builder.build()?,
             imports: self.imports,
+            native_handlers: self.native_handlers,
             interfaces,
         })
     }
@@ -426,10 +429,14 @@ impl<'a, TCtxt> ModuleBuilder<'a, TCtxt> {
 /// notifications. See [`ModuleBuilder`].
 pub struct Module<TCodeAlloc: Allocator, TCtxt> {
     /// The compiled module.
-    inner: low_level_vm::Module<TCodeAlloc, TCtxt>,
+    inner: low_level_vm::Module<TCodeAlloc>,
     /// Imported functions of the module, ordered by import index.
     // TODO: remove?
     imports: Vec<ModuleImport>,
+    /// Native handler of each imported function, or `None` if the messages sent through this
+    /// import must be delivered to the handler program of its interface. Ordered the same way
+    /// as `imports`.
+    native_handlers: Vec<Option<fn(&mut TCtxt, MessageAccess<'_>) -> Outcome>>,
     /// Interfaces used by the imported functions, sorted and without duplicates.
     interfaces: Vec<[u8; 32]>,
 }
@@ -534,13 +541,16 @@ impl<
         self,
     ) -> Result<InstanceRef<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>, low_level_vm::Error>
     {
-        let instance = low_level_vm::Instance::new(
-            InstanceModule(self.module),
+        let vm = low_level_vm::Instance::new(
+            InstanceModule(self.module, PhantomData),
             self.trap_handlers,
-            self.ctxt,
             self.stack_allocator,
             self.memory_allocator,
         )?;
+        let instance = RunningInstance {
+            vm,
+            ctxt: self.ctxt,
+        };
 
         Ok(InstanceRef {
             inner: Arc::new(InstanceRefInner {
