@@ -27,14 +27,17 @@
 //! - The called function returns.
 //! - The Wasm code calls an imported function. The host gets a [`RunOutcome::ImportCall`] and
 //!   can later continue the execution with [`Instance::resume`].
+//! - The Wasm code executes `memory.grow`. The host gets a [`RunOutcome::MemoryGrow`], can
+//!   grow the memory with [`Instance::grow_memory`], and can later continue the execution with
+//!   [`Instance::resume`].
 //! - The Wasm code traps. Cranelift compiles traps into `ud2` instructions or relies on the
 //!   CPU raising an exception. The resulting `SIGILL`, `SIGFPE` or `SIGSEGV` is caught by a
 //!   signal handler (see [`install_trap_handlers`]) that redirects the execution to a routine
 //!   that abandons the Wasm stack and jumps back to the host stack.
 //!
 //! The memory of the compiled code, of the native stacks, and of the linear memories is
-//! obtained from implementations of [`Allocator`] passed by the user. `memory.grow` calls
-//! [`Allocator::grow_zeroed`] on the allocator of the linear memory of the instance.
+//! obtained from implementations of [`Allocator`] passed by the user. [`Instance::grow_memory`]
+//! calls [`Allocator::grow_zeroed`] on the allocator of the linear memory of the instance.
 //!
 //! The allocator of the native stacks is wrapped in a [`WithStackGuard`], so that a stack
 //! overflow faults in the guard region below the stack instead of overwriting the memory located
@@ -95,6 +98,11 @@ const OUTCOME_FINISHED: u64 = 0;
 const OUTCOME_IMPORT: u64 = 1;
 /// Value returned by `init_vm_switch` on the host side when the Wasm code has trapped.
 const OUTCOME_TRAP: u64 = 2;
+
+/// Value written by the compiled code to the `import_idx` field of the [`VmCtx`] before
+/// yielding, in order to indicate that it executes `memory.grow` rather than calling an import.
+/// Can never be a valid function index, as the validator limits the number of functions.
+const IMPORT_IDX_MEMORY_GROW: u32 = u32::MAX;
 
 global_asm!(
     // `init_vm_switch(save_rsp: *mut u64, new_rsp: u64, value: u64) -> u64`
@@ -190,61 +198,6 @@ unsafe extern "sysv64" {
     fn init_vm_sigreturn();
 }
 
-/// Called by the Wasm code in order to execute `memory.grow`, with the number of pages to add
-/// to the memory, on the Wasm stack.
-///
-/// Grows the memory with [`Allocator::grow_zeroed`] and returns the previous number of pages,
-/// or `u32::MAX` if the memory can't be grown.
-///
-/// `TMemAlloc` must be the type of the allocator that `mem_allocator` points to.
-///
-/// Note that a panic in the allocator aborts the process, as unwinding out of this function
-/// isn't possible.
-unsafe extern "sysv64" fn init_vm_memory_grow<TMemAlloc: Allocator>(
-    vmctx: *mut VmCtx,
-    delta: u32,
-) -> u32 {
-    unsafe {
-        let old_len = (*vmctx).mem_len;
-        let old_pages = old_len / WASM_PAGE_SIZE;
-        // `mem_max_pages` is at most 65536, as checked by the validator, hence the number of
-        // pages always fits in a `u32` and is never equal to `u32::MAX`.
-        let old_pages_u32 = u32::try_from(old_pages).unwrap_or_else(|_| unreachable!());
-        // Can't overflow, as both numbers fit in 32 bits.
-        let new_pages = old_pages + u64::from(delta);
-        if new_pages > (*vmctx).mem_max_pages {
-            return u32::MAX;
-        }
-        if delta == 0 {
-            return old_pages_u32;
-        }
-
-        let new_len = new_pages * WASM_PAGE_SIZE;
-        let Some(new_layout) = usize::try_from(new_len)
-            .ok()
-            .and_then(|size| Layout::from_size_align(size, MEMORY_ALIGN).ok())
-        else {
-            return u32::MAX;
-        };
-        // The current memory has been successfully allocated with this layout.
-        let old_layout = Layout::from_size_align(
-            usize::try_from(old_len).unwrap_or_else(|_| unreachable!()),
-            MEMORY_ALIGN,
-        )
-        .unwrap_or_else(|_| unreachable!());
-
-        let allocator = &*(*vmctx).mem_allocator.cast::<TMemAlloc>();
-        match allocator.grow_zeroed((*vmctx).mem_base, old_layout, new_layout) {
-            Ok(new_memory) => {
-                (*vmctx).mem_base = new_memory.cast::<u8>();
-                (*vmctx).mem_len = new_len;
-                old_pages_u32
-            }
-            Err(_) => u32::MAX,
-        }
-    }
-}
-
 thread_local! {
     /// Context of the instance currently executing Wasm code on this thread, or null if none.
     ///
@@ -316,6 +269,12 @@ pub enum RunOutcome {
     /// [`Module::imports_by_index`]) with the given arguments. Call [`Instance::resume`] with
     /// the return value in order to continue the execution.
     ImportCall { import: u32, args: Vec<Value> },
+    /// The Wasm code has executed `memory.grow` in order to add `delta` pages to its linear
+    /// memory. The memory hasn't been grown yet. Call [`Instance::grow_memory`] in order to grow
+    /// it (or don't, in order to deny the request), then call [`Instance::resume`] with the
+    /// result of `memory.grow`, which is the previous number of pages as an `i32`, or `-1` if
+    /// the memory hasn't been grown.
+    MemoryGrow { delta: u32 },
 }
 
 impl From<wasmparser::BinaryReaderError> for Error {
@@ -343,22 +302,18 @@ impl fmt::Display for Error {
 /// Context passed as hidden first parameter to every compiled function.
 #[repr(C)]
 struct VmCtx {
-    /// Linear memory, allocated with `mem_allocator`, [`MEMORY_ALIGN`] and a size of `mem_len`.
+    /// Linear memory, allocated with the `memory_allocator` of the [`Instance`],
+    /// [`MEMORY_ALIGN`] and a size of `mem_len`.
     mem_base: NonNull<u8>,
     /// Size in bytes of the linear memory. Always a multiple of [`WASM_PAGE_SIZE`].
     mem_len: u64,
     /// Maximum number of pages of the linear memory. At most 65536.
     mem_max_pages: u64,
-    /// Allocator of the linear memory, whose type is erased. Owned by the [`Instance`].
-    mem_allocator: *const (),
-    /// [`init_vm_memory_grow`] instantiated with the type of `mem_allocator`. Called by the
-    /// compiled code.
-    mem_grow: unsafe extern "sysv64" fn(*mut VmCtx, u32) -> u32,
     globals: *mut u64,
     /// Buffer used to pass parameters and results between the host and the Wasm code.
     values: *mut u64,
-    /// Index of the import called by the Wasm code, written by the compiled code before it
-    /// yields.
+    /// Index of the import called by the Wasm code, or [`IMPORT_IDX_MEMORY_GROW`], written by
+    /// the compiled code before it yields.
     import_idx: u32,
     /// Signature of each function of the module, imported functions first.
     funcs: *const FuncSig,
@@ -1210,9 +1165,8 @@ pub struct Instance<
     /// [`STACK_LAYOUT`].
     stack: NonNull<u8>,
     stack_allocator: WithStackGuard<TStackAlloc>,
-    /// Allocator of the linear memory, obtained from `Box::into_raw`. Accessed through
-    /// `vmctx` by [`init_vm_memory_grow`], hence why it is boxed and a raw pointer.
-    memory_allocator: NonNull<TMemAlloc>,
+    /// Allocator of the linear memory.
+    memory_allocator: TMemAlloc,
     // These fields are accessed through raw pointers in `vmctx`.
     _globals: Vec<u64>,
     _values: Vec<u64>,
@@ -1224,6 +1178,8 @@ enum InstanceState {
     Idle,
     /// The execution of `export_func` is suspended while the host executes `import`.
     Suspended { export_func: u32, import: u32 },
+    /// The execution of `export_func` is suspended while the host executes `memory.grow`.
+    SuspendedMemoryGrow { export_func: u32 },
 }
 
 impl<
@@ -1240,11 +1196,8 @@ impl<
     /// meaning that the memory obtained from `stack_allocator` must be readable and writable,
     /// and that `mprotect` must be usable on it.
     ///
-    /// The linear memory is allocated with [`Allocator::allocate_zeroed`], and `memory.grow`
-    /// calls [`Allocator::grow_zeroed`]. The latter is called directly by the compiled Wasm code,
-    /// on the 1 MiB native stack of the instance. A panic in [`Allocator::grow_zeroed`] aborts
-    /// the process, as unwinding through the frames of the Wasm code isn't possible, and a fault
-    /// in it isn't reported as a Wasm trap.
+    /// The linear memory is allocated with [`Allocator::allocate_zeroed`], and
+    /// [`Instance::grow_memory`] calls [`Allocator::grow_zeroed`].
     pub fn new(
         module: TModule,
         _trap_handlers: &TrapHandlers,
@@ -1298,16 +1251,11 @@ impl<
             }
         };
 
-        // Moving an allocator doesn't invalidate the memory blocks it has allocated.
-        let memory_allocator = NonNull::from(Box::leak(Box::new(memory_allocator)));
-
         let code_start = module_ref.code.as_ptr() as u64;
         let vmctx = Box::into_raw(Box::new(VmCtx {
             mem_base: memory,
             mem_len,
             mem_max_pages: module_ref.memory_max_pages,
-            mem_allocator: memory_allocator.as_ptr().cast_const().cast::<()>(),
-            mem_grow: init_vm_memory_grow::<TMemAlloc>,
             globals: globals.as_mut_ptr(),
             values: values.as_mut_ptr(),
             import_idx: 0,
@@ -1373,19 +1321,74 @@ impl<
         self.run(func_idx)
     }
 
-    /// Resumes the execution suspended in a call to an import, passing the given return value
-    /// of that import. `result` must be `None` if the import has no result.
+    /// Resumes the execution suspended in a call to an import or in `memory.grow`, passing the
+    /// given return value of that import or of `memory.grow`. `result` must be `None` if the
+    /// import has no result, and must be a [`Value::I32`] in the case of `memory.grow`.
     pub fn resume(&mut self, result: Option<Value>) -> Result<RunOutcome, Error> {
-        let InstanceState::Suspended {
-            export_func,
-            import,
-        } = self.state
-        else {
-            return Err(Error::NotSuspended);
-        };
-        let module = self.module.as_ref();
-        self.write_values(&module.funcs[import as usize].results, result.as_slice())?;
-        self.run(export_func)
+        match self.state {
+            InstanceState::Idle => Err(Error::NotSuspended),
+            InstanceState::Suspended {
+                export_func,
+                import,
+            } => {
+                let module = self.module.as_ref();
+                self.write_values(&module.funcs[import as usize].results, result.as_slice())?;
+                self.run(export_func)
+            }
+            InstanceState::SuspendedMemoryGrow { export_func } => {
+                self.write_values(&[types::I32], result.as_slice())?;
+                self.run(export_func)
+            }
+        }
+    }
+
+    /// Grows the linear memory by `delta` pages, and returns the number of pages before the
+    /// growth.
+    ///
+    /// The memory is grown with [`Allocator::grow_zeroed`], meaning that its content might be
+    /// moved. Returns `None` and leaves the memory untouched if the new number of pages would
+    /// exceed the maximum allowed by the module, or if the allocation fails.
+    ///
+    /// This is typically called after a [`RunOutcome::MemoryGrow`], but can be called at any
+    /// time, including while the execution is suspended in a call to an import.
+    pub fn grow_memory(&mut self, delta: u32) -> Option<u32> {
+        // SAFETY: the Wasm code isn't running, as `self` is borrowed mutably.
+        let vmctx = unsafe { &mut *self.vmctx };
+        let old_len = vmctx.mem_len;
+        let old_pages = old_len / WASM_PAGE_SIZE;
+        // `mem_max_pages` is at most 65536, as checked by the validator, hence the number of
+        // pages always fits in a `u32`.
+        let old_pages_u32 = u32::try_from(old_pages).unwrap_or_else(|_| unreachable!());
+        // Can't overflow, as both numbers fit in 32 bits.
+        let new_pages = old_pages + u64::from(delta);
+        if new_pages > vmctx.mem_max_pages {
+            return None;
+        }
+        if delta == 0 {
+            return Some(old_pages_u32);
+        }
+
+        let new_len = new_pages * WASM_PAGE_SIZE;
+        let new_layout = usize::try_from(new_len)
+            .ok()
+            .and_then(|size| Layout::from_size_align(size, MEMORY_ALIGN).ok())?;
+        // The current memory has been successfully allocated with this layout.
+        let old_layout = Layout::from_size_align(
+            usize::try_from(old_len).unwrap_or_else(|_| unreachable!()),
+            MEMORY_ALIGN,
+        )
+        .unwrap_or_else(|_| unreachable!());
+
+        // SAFETY: `mem_base` was allocated with `memory_allocator` and `old_layout`, and
+        // `new_layout` is larger than `old_layout`.
+        let new_memory = unsafe {
+            self.memory_allocator
+                .grow_zeroed(vmctx.mem_base, old_layout, new_layout)
+        }
+        .ok()?;
+        vmctx.mem_base = new_memory.cast::<u8>();
+        vmctx.mem_len = new_len;
+        Some(old_pages_u32)
     }
 
     /// Switches to the Wasm stack, and returns when the execution of `export_func` finishes,
@@ -1404,6 +1407,15 @@ impl<
                 Ok(RunOutcome::Return(
                     self.read_values(&module.funcs[export_func as usize].results),
                 ))
+            }
+            OUTCOME_IMPORT if unsafe { (*vmctx).import_idx } == IMPORT_IDX_MEMORY_GROW => {
+                self.state = InstanceState::SuspendedMemoryGrow { export_func };
+                // The compiled code has written the zero-extended delta to the first slot of
+                // the values buffer, which always has at least one slot.
+                let raw_delta = unsafe { (*vmctx).values.read() };
+                Ok(RunOutcome::MemoryGrow {
+                    delta: u32::try_from(raw_delta).unwrap_or_else(|_| unreachable!()),
+                })
             }
             OUTCOME_IMPORT => {
                 let import = unsafe { (*vmctx).import_idx };
@@ -1500,7 +1512,6 @@ impl<
         // The Wasm stack contains no Rust frames, so a suspended execution can simply be
         // discarded.
         let vmctx = unsafe { Box::from_raw(self.vmctx) };
-        let memory_allocator = unsafe { Box::from_raw(self.memory_allocator.as_ptr()) };
         // The memory was successfully allocated or grown with this layout.
         let mem_layout = Layout::from_size_align(
             usize::try_from(vmctx.mem_len).unwrap_or_else(|_| unreachable!()),
@@ -1508,7 +1519,7 @@ impl<
         )
         .unwrap_or_else(|_| unreachable!());
         // SAFETY: `mem_base` was allocated with `memory_allocator` and `mem_layout`.
-        unsafe { memory_allocator.deallocate(vmctx.mem_base, mem_layout) };
+        unsafe { self.memory_allocator.deallocate(vmctx.mem_base, mem_layout) };
         // SAFETY: `stack` was allocated with `stack_allocator` and `STACK_LAYOUT`.
         unsafe { self.stack_allocator.deallocate(self.stack, STACK_LAYOUT) };
     }
@@ -2186,21 +2197,37 @@ impl<'a> Translator<'a> {
                 self.stack.push(v);
             }
             Operator::MemoryGrow { .. } => {
-                // Calls the `init_vm_memory_grow` function stored in the `VmCtx`, which is
-                // specific to the type of allocator of the instance. The memory might move, but
-                // `mem_base` and `mem_len` are loaded again from the `VmCtx` at each access.
+                // Similar to calling an import: writes the zero-extended delta to the first slot
+                // of the values buffer and `IMPORT_IDX_MEMORY_GROW` to `import_idx`, then
+                // switches back to the host with `init_vm_yield`. The host might grow the memory
+                // and writes the result to the values buffer before resuming the execution. The
+                // memory might move, but `mem_base` and `mem_len` are loaded again from the
+                // `VmCtx` at each access.
                 let delta = self.stack.pop().unwrap_or_else(|| unreachable!());
-                let mut sig = Signature::new(CallConv::SystemV);
-                sig.params.push(AbiParam::new(i64t));
-                sig.params.push(AbiParam::new(i32t));
-                sig.returns.push(AbiParam::new(i32t));
-                let sig = self.builder.import_signature(sig);
-                let callee = self.vmctx_load(offset_of!(VmCtx, mem_grow));
-                let call = self
+                let delta = self.builder.ins().uextend(i64t, delta);
+                // The values buffer always has at least one slot.
+                let values = self.vmctx_load(offset_of!(VmCtx, values));
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), delta, values, 0);
+                let import_idx = self
                     .builder
                     .ins()
-                    .call_indirect(sig, callee, &[self.vmctx, delta]);
-                let v = self.builder.inst_results(call)[0];
+                    .iconst(i32t, i64::from(IMPORT_IDX_MEMORY_GROW));
+                self.builder.ins().store(
+                    MemFlagsData::trusted(),
+                    import_idx,
+                    self.vmctx,
+                    offset_of!(VmCtx, import_idx) as i32,
+                );
+                self.builder.ins().call(self.yield_ref, &[self.vmctx]);
+
+                let values = self.vmctx_load(offset_of!(VmCtx, values));
+                let raw_result = self
+                    .builder
+                    .ins()
+                    .load(i64t, MemFlagsData::trusted(), values, 0);
+                let v = self.builder.ins().ireduce(i32t, raw_result);
                 self.stack.push(v);
             }
 

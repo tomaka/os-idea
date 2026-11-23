@@ -86,6 +86,17 @@ impl<
             let (import, args) = match outcome {
                 low_level_vm::RunOutcome::Return(values) => return Ok(values),
                 low_level_vm::RunOutcome::ImportCall { import, args } => (import, args),
+                low_level_vm::RunOutcome::MemoryGrow { delta } => {
+                    let result = match instance.vm.grow_memory(delta) {
+                        // The number of pages is at most 65536, and thus always fits in an `i32`.
+                        Some(old_pages) => {
+                            i32::try_from(old_pages).unwrap_or_else(|_| unreachable!())
+                        }
+                        None => -1,
+                    };
+                    outcome = instance.vm.resume(Some(low_level_vm::Value::I32(result)))?;
+                    continue;
+                }
             };
 
             // `import` is always a valid import index.
