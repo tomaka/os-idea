@@ -18,9 +18,7 @@
 //! # Execution model
 //!
 //! Every [`Instance`] owns a native stack, separate from the stack of the host, on which the
-//! Wasm code runs. Switching between the host stack and the Wasm stack is done by a small
-//! assembly routine (`init_vm_switch`) that saves the callee-saved registers and the stack
-//! pointer of one side and restores the ones of the other side.
+//! Wasm code runs.
 //!
 //! Execution of the Wasm code switches back to the host stack when:
 //!
@@ -45,7 +43,6 @@
 
 use core::{
     alloc::{Allocator, Layout},
-    arch::global_asm,
     cell::Cell,
     fmt,
     marker::PhantomData,
@@ -57,16 +54,19 @@ use std::collections::BTreeMap;
 
 use crate::alloc_stack_guard::{self, WithStackGuard};
 
+mod stack_switch;
+
 use cranelift_codegen::{
-    Context, FinalizedRelocTarget,
     binemit::Reloc,
     control::ControlPlane,
     ir::{
-        self, AbiParam, BlockArg, BlockCall, ExtFuncData, ExternalName, InstBuilder, JumpTableData,
-        MemFlagsData, Signature, TrapCode, UserExternalName, UserFuncName, condcodes::IntCC, types,
+        self, condcodes::IntCC, types, AbiParam, BlockArg, BlockCall, ExtFuncData, ExternalName,
+        InstBuilder, JumpTableData, MemFlagsData, Signature, TrapCode, UserExternalName,
+        UserFuncName,
     },
     isa::{CallConv, OwnedTargetIsa},
     settings::{self, Configurable as _},
+    Context, FinalizedRelocTarget,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use wasmparser::{BlockType, FuncType, Operator, Payload, ValType};
@@ -79,7 +79,7 @@ const NAMESPACE_WASM_FUNC: u32 = 0;
 /// Namespace of the [`UserExternalName`]s that designate trampolines.
 const NAMESPACE_TRAMPOLINE: u32 = 1;
 /// Namespace of the [`UserExternalName`]s that designate routines of the host:
-/// `init_vm_yield` at index 0.
+/// [`stack_switch::stack_switch_yield`] at index 0.
 const NAMESPACE_HOST: u32 = 2;
 
 /// Layout of the native stack of each instance.
@@ -92,111 +92,10 @@ const MEMORY_ALIGN: usize = 16;
 /// Size in bytes of the alternate signal stack, if one has to be allocated.
 const SIGNAL_STACK_SIZE: usize = 64 * 1024;
 
-/// Value returned by `init_vm_switch` on the host side when the Wasm function has returned.
-const OUTCOME_FINISHED: u64 = 0;
-/// Value returned by `init_vm_switch` on the host side when the Wasm code calls an import.
-const OUTCOME_IMPORT: u64 = 1;
-/// Value returned by `init_vm_switch` on the host side when the Wasm code has trapped.
-const OUTCOME_TRAP: u64 = 2;
-
 /// Value written by the compiled code to the `import_idx` field of the [`VmCtx`] before
 /// yielding, in order to indicate that it executes `memory.grow` rather than calling an import.
 /// Can never be a valid function index, as the validator limits the number of functions.
 const IMPORT_IDX_MEMORY_GROW: u32 = u32::MAX;
-
-global_asm!(
-    // `init_vm_switch(save_rsp: *mut u64, new_rsp: u64, value: u64) -> u64`
-    //
-    // Pushes the callee-saved registers on the current stack, writes the stack pointer to
-    // `save_rsp`, then switches to the stack `new_rsp`, pops the callee-saved registers from
-    // it and returns `value` to whoever had pushed them.
-    ".text",
-    ".p2align 4",
-    ".globl init_vm_switch",
-    "init_vm_switch:",
-    "push rbp",
-    "push rbx",
-    "push r12",
-    "push r13",
-    "push r14",
-    "push r15",
-    "mov [rdi], rsp",
-    "mov rsp, rsi",
-    "mov rax, rdx",
-    "pop r15",
-    "pop r14",
-    "pop r13",
-    "pop r12",
-    "pop rbx",
-    "pop rbp",
-    "ret",
-    // `init_vm_fiber_start`
-    //
-    // Reached through the `ret` of `init_vm_switch` when switching to a fresh stack prepared
-    // by `Instance::call`, with `r12` = `vmctx`, `r13` = values buffer, `r14` = trampoline.
-    ".p2align 4",
-    ".globl init_vm_fiber_start",
-    "init_vm_fiber_start:",
-    "mov rdi, r12",
-    "mov rsi, r13",
-    "call r14",
-    "lea rdi, [r12 + {wasm_rsp}]",
-    "mov rsi, [r12 + {host_rsp}]",
-    "mov edx, {finished}",
-    "call init_vm_switch",
-    "ud2",
-    // `init_vm_yield(vmctx: *mut VmCtx)`
-    //
-    // Called by the Wasm code in order to call an import. Switches back to the host, and
-    // returns when the host resumes the execution.
-    ".p2align 4",
-    ".globl init_vm_yield",
-    "init_vm_yield:",
-    "mov rsi, [rdi + {host_rsp}]",
-    "lea rdi, [rdi + {wasm_rsp}]",
-    "mov edx, {import}",
-    "jmp init_vm_switch",
-    // `init_vm_trap_landing(vmctx: *mut VmCtx)`
-    //
-    // Jumped to by the signal handler when the Wasm code traps. Abandons the Wasm stack and
-    // returns to the host.
-    ".p2align 4",
-    ".globl init_vm_trap_landing",
-    "init_vm_trap_landing:",
-    "mov rsp, [rdi + {host_rsp}]",
-    "mov eax, {trap}",
-    "pop r15",
-    "pop r14",
-    "pop r13",
-    "pop r12",
-    "pop rbx",
-    "pop rbp",
-    "ret",
-    // `init_vm_sigreturn`
-    //
-    // Restorer of the signal handlers, as required by `rt_sigaction`.
-    ".p2align 4",
-    ".globl init_vm_sigreturn",
-    "init_vm_sigreturn:",
-    "mov eax, 15", // `rt_sigreturn`
-    "syscall",
-    "ud2",
-    wasm_rsp = const offset_of!(VmCtx, wasm_rsp),
-    host_rsp = const offset_of!(VmCtx, host_rsp),
-    finished = const OUTCOME_FINISHED,
-    import = const OUTCOME_IMPORT,
-    trap = const OUTCOME_TRAP,
-);
-
-// The assembly code only accesses the fields of `VmCtx` that are FFI-safe.
-#[allow(improper_ctypes)]
-unsafe extern "sysv64" {
-    fn init_vm_switch(save_rsp: *mut u64, new_rsp: u64, value: u64) -> u64;
-    fn init_vm_fiber_start();
-    fn init_vm_yield(vmctx: *mut VmCtx);
-    fn init_vm_trap_landing(vmctx: *mut VmCtx);
-    fn init_vm_sigreturn();
-}
 
 thread_local! {
     /// Context of the instance currently executing Wasm code on this thread, or null if none.
@@ -325,10 +224,8 @@ struct VmCtx {
     trap_pc: u64,
     /// Faulting address of the latest trap, written by the signal handler.
     trap_addr: u64,
-    /// Stack pointer of the host, saved while the Wasm code runs.
-    host_rsp: u64,
-    /// Stack pointer of the Wasm code, saved while the host runs.
-    wasm_rsp: u64,
+    /// Stack pointers of the host and of the Wasm code. The Wasm code runs as the fiber.
+    stacks: stack_switch::Context,
     /// Range of addresses of the compiled code of the module.
     code_start: u64,
     code_end: u64,
@@ -817,7 +714,7 @@ impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
 
         for (offset, kind, target, addend) in relocs {
             let target_addr = if target == (NAMESPACE_HOST, 0) {
-                (init_vm_yield as *const ()).addr() as i64 + addend
+                (stack_switch::stack_switch_yield as *const ()).addr() as i64 + addend
             } else {
                 (code_base + offsets[&target]) as i64 + addend
             };
@@ -1078,7 +975,7 @@ pub unsafe fn install_trap_handlers() -> Result<TrapHandlers, Error> {
         flags: KernelSigaction::SA_SIGINFO
             | KernelSigaction::SA_ONSTACK
             | KernelSigaction::SA_RESTORER,
-        restorer: (init_vm_sigreturn as *const ()).addr(),
+        restorer: (stack_switch::stack_switch_sigreturn as *const ()).addr(),
         mask: 0,
     };
     for signal in [
@@ -1104,7 +1001,8 @@ pub unsafe fn install_trap_handlers() -> Result<TrapHandlers, Error> {
 /// Handler of `SIGILL`, `SIGFPE` and `SIGSEGV`.
 ///
 /// If the fault comes from Wasm code, records the details of the fault in the `VmCtx` and
-/// modifies the interrupted context so that the execution continues in `init_vm_trap_landing`.
+/// modifies the interrupted context so that the execution continues in
+/// [`stack_switch::stack_switch_abandon`].
 unsafe extern "C" fn trap_signal_handler(signal: u32, info: *mut u8, context: *mut u8) {
     // Offsets in `siginfo_t` and `ucontext_t` on x86-64 Linux.
     const SI_ADDR_OFFSET: usize = 16;
@@ -1124,8 +1022,10 @@ unsafe extern "C" fn trap_signal_handler(signal: u32, info: *mut u8, context: *m
             (*vmctx).trap_addr = fault_addr;
             gregs
                 .add(REG_RIP)
-                .write_unaligned((init_vm_trap_landing as *const ()).addr() as u64);
-            gregs.add(REG_RDI).write_unaligned(vmctx as u64);
+                .write_unaligned((stack_switch::stack_switch_abandon as *const ()).addr() as u64);
+            gregs
+                .add(REG_RDI)
+                .write_unaligned((&raw mut (*vmctx).stacks).addr() as u64);
             return;
         }
 
@@ -1183,11 +1083,11 @@ enum InstanceState {
 }
 
 impl<
-    TModule: AsRef<Module<TCodeAlloc>>,
-    TCodeAlloc: Allocator,
-    TStackAlloc: Allocator,
-    TMemAlloc: Allocator,
-> Instance<TModule, TCodeAlloc, TStackAlloc, TMemAlloc>
+        TModule: AsRef<Module<TCodeAlloc>>,
+        TCodeAlloc: Allocator,
+        TStackAlloc: Allocator,
+        TMemAlloc: Allocator,
+    > Instance<TModule, TCodeAlloc, TStackAlloc, TMemAlloc>
 {
     /// Instantiates the given module. Its native stack is allocated with `stack_allocator`, and
     /// its linear memory with `memory_allocator`.
@@ -1264,8 +1164,7 @@ impl<
             trap_signal: 0,
             trap_pc: 0,
             trap_addr: 0,
-            host_rsp: 0,
-            wasm_rsp: 0,
+            stacks: stack_switch::Context::new(),
             code_start,
             code_end: code_start + module_ref.code_layout.size() as u64,
         }));
@@ -1298,24 +1197,20 @@ impl<
         self.write_values(&module.funcs[func_idx as usize].params, args)?;
         self.state = InstanceState::Idle;
 
-        // Prepare the Wasm stack so that `init_vm_switch` "returns" into `init_vm_fiber_start`
-        // with the expected registers, and with a stack pointer aligned on 16 bytes.
-        let stack_top = self.stack.as_ptr() as u64 + STACK_LAYOUT.size() as u64;
-        let frame: [u64; 9] = [
-            0,                                                // r15
-            module.code.as_ptr() as u64 + offset as u64,      // r14: trampoline
-            unsafe { (*self.vmctx).values } as u64,           // r13
-            self.vmctx as u64,                                // r12
-            0,                                                // rbx
-            0,                                                // rbp
-            (init_vm_fiber_start as *const ()).addr() as u64, // return address
-            0,
-            0,
-        ];
-        let frame_start = stack_top - 9 * 8;
+        // SAFETY: the stack was allocated with `STACK_LAYOUT`, which has an alignment of 16,
+        // and isn't used by anything else. The `VmCtx` is boxed and outlives the execution.
+        // The trampoline has the signature `extern "sysv64" fn(*mut VmCtx, *mut u64)` and
+        // doesn't unwind.
         unsafe {
-            ptr::copy_nonoverlapping(frame.as_ptr(), frame_start as *mut u64, frame.len());
-            (*self.vmctx).wasm_rsp = frame_start;
+            let stack_top = self.stack.add(STACK_LAYOUT.size());
+            let trampoline = module.code.add(offset);
+            stack_switch::prepare(
+                &raw mut (*self.vmctx).stacks,
+                stack_top,
+                trampoline,
+                self.vmctx.cast::<()>(),
+                (*self.vmctx).values.cast::<()>(),
+            );
         }
 
         self.run(func_idx)
@@ -1398,17 +1293,21 @@ impl<
         let module = self.module.as_ref();
 
         let previous = CURRENT_VMCTX.replace(vmctx);
-        let outcome = unsafe { init_vm_switch(&raw mut (*vmctx).host_rsp, (*vmctx).wasm_rsp, 0) };
+        // SAFETY: the stack is prepared by `Instance::call`, and `self.state` tracks whether the
+        // execution is suspended.
+        let outcome = unsafe { stack_switch::resume(&raw mut (*vmctx).stacks) };
         CURRENT_VMCTX.set(previous);
 
         match outcome {
-            OUTCOME_FINISHED => {
+            stack_switch::Outcome::Finished => {
                 self.state = InstanceState::Idle;
                 Ok(RunOutcome::Return(
                     self.read_values(&module.funcs[export_func as usize].results),
                 ))
             }
-            OUTCOME_IMPORT if unsafe { (*vmctx).import_idx } == IMPORT_IDX_MEMORY_GROW => {
+            stack_switch::Outcome::Yielded
+                if unsafe { (*vmctx).import_idx } == IMPORT_IDX_MEMORY_GROW =>
+            {
                 self.state = InstanceState::SuspendedMemoryGrow { export_func };
                 // The compiled code has written the zero-extended delta to the first slot of
                 // the values buffer, which always has at least one slot.
@@ -1417,7 +1316,7 @@ impl<
                     delta: u32::try_from(raw_delta).unwrap_or_else(|_| unreachable!()),
                 })
             }
-            OUTCOME_IMPORT => {
+            stack_switch::Outcome::Yielded => {
                 let import = unsafe { (*vmctx).import_idx };
                 self.state = InstanceState::Suspended {
                     export_func,
@@ -1428,7 +1327,7 @@ impl<
                     args: self.read_values(&module.funcs[import as usize].params),
                 })
             }
-            OUTCOME_TRAP => {
+            stack_switch::Outcome::Abandoned => {
                 self.state = InstanceState::Idle;
                 let pc = unsafe { (*vmctx).trap_pc };
 
@@ -1461,7 +1360,6 @@ impl<
                 };
                 Err(Error::Trap(trap))
             }
-            _ => unreachable!(),
         }
     }
 
@@ -1502,11 +1400,11 @@ impl<
 }
 
 impl<
-    TModule: AsRef<Module<TCodeAlloc>>,
-    TCodeAlloc: Allocator,
-    TStackAlloc: Allocator,
-    TMemAlloc: Allocator,
-> Drop for Instance<TModule, TCodeAlloc, TStackAlloc, TMemAlloc>
+        TModule: AsRef<Module<TCodeAlloc>>,
+        TCodeAlloc: Allocator,
+        TStackAlloc: Allocator,
+        TMemAlloc: Allocator,
+    > Drop for Instance<TModule, TCodeAlloc, TStackAlloc, TMemAlloc>
 {
     fn drop(&mut self) {
         // The Wasm stack contains no Rust frames, so a suspended execution can simply be
@@ -1570,7 +1468,7 @@ struct Translator<'a> {
     frames: Vec<Frame>,
     reachable: bool,
     func_refs: BTreeMap<u32, ir::FuncRef>,
-    /// Reference to `init_vm_yield`.
+    /// Reference to [`stack_switch::stack_switch_yield`].
     yield_ref: ir::FuncRef,
 }
 
@@ -1953,7 +1851,7 @@ impl<'a> Translator<'a> {
             Operator::Call { function_index } if (function_index as usize) < self.num_imports => {
                 // Calling an import consists in writing its parameters to the values buffer and
                 // its index to `import_idx`, then switching back to the host with
-                // `init_vm_yield`. The host writes the result to the values buffer before
+                // `stack_switch_yield`. The host writes the result to the values buffer before
                 // resuming the execution.
                 // `Builder::build` checks that all imports have at most one result.
                 let funcs = self.funcs;
@@ -1983,7 +1881,11 @@ impl<'a> Translator<'a> {
                     self.vmctx,
                     offset_of!(VmCtx, import_idx) as i32,
                 );
-                self.builder.ins().call(self.yield_ref, &[self.vmctx]);
+                let stacks = self
+                    .builder
+                    .ins()
+                    .iadd_imm_u(self.vmctx, offset_of!(VmCtx, stacks) as i64);
+                self.builder.ins().call(self.yield_ref, &[stacks]);
 
                 if let Some(ty) = result_ty {
                     let values = self.vmctx_load(offset_of!(VmCtx, values));
@@ -2046,7 +1948,9 @@ impl<'a> Translator<'a> {
                     self.builder
                         .ins()
                         .icmp(IntCC::UnsignedGreaterThanOrEqual, index, table_len);
-                self.builder.ins().trapnz(oob, TrapCode::user(2).unwrap_or_else(|| unreachable!()));
+                self.builder
+                    .ins()
+                    .trapnz(oob, TrapCode::user(2).unwrap_or_else(|| unreachable!()));
 
                 // Load the element, and check that it is non-null and has the right signature.
                 let entry_offset = self
@@ -2199,7 +2103,7 @@ impl<'a> Translator<'a> {
             Operator::MemoryGrow { .. } => {
                 // Similar to calling an import: writes the zero-extended delta to the first slot
                 // of the values buffer and `IMPORT_IDX_MEMORY_GROW` to `import_idx`, then
-                // switches back to the host with `init_vm_yield`. The host might grow the memory
+                // switches back to the host with `stack_switch_yield`. The host might grow the memory
                 // and writes the result to the values buffer before resuming the execution. The
                 // memory might move, but `mem_base` and `mem_len` are loaded again from the
                 // `VmCtx` at each access.
@@ -2220,7 +2124,11 @@ impl<'a> Translator<'a> {
                     self.vmctx,
                     offset_of!(VmCtx, import_idx) as i32,
                 );
-                self.builder.ins().call(self.yield_ref, &[self.vmctx]);
+                let stacks = self
+                    .builder
+                    .ins()
+                    .iadd_imm_u(self.vmctx, offset_of!(VmCtx, stacks) as i64);
+                self.builder.ins().call(self.yield_ref, &[stacks]);
 
                 let values = self.vmctx_load(offset_of!(VmCtx, values));
                 let raw_result = self
