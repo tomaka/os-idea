@@ -47,7 +47,7 @@ use core::{
     cell::Cell,
     fmt,
     marker::PhantomData,
-    mem::{self, offset_of},
+    mem::{self, MaybeUninit, offset_of},
     pin::Pin,
     ptr::{self, NonNull},
     slice,
@@ -1088,14 +1088,29 @@ pub struct Instance<
     /// pointer.
     vmctx: *mut VmCtx,
     state: InstanceState,
-    /// Native stack on which the Wasm code runs, allocated with [`STACK_LAYOUT`].
-    stack_ctx: Pin<Box<stack_switch::Context<WithStackGuard<TStackAlloc>>>>,
+    /// Native stack on which the Wasm code runs, allocated with [`STACK_LAYOUT`]. Whether it
+    /// is initialized is indicated by `stack_ctx_state`. Its location never changes, as it is
+    /// pointed to by `vmctx`.
+    stack_ctx: Pin<Box<MaybeUninit<stack_switch::Context<WithStackGuard<TStackAlloc>>>>>,
+    stack_ctx_state: StackCtxState<WithStackGuard<TStackAlloc>>,
     /// Allocator of the linear memory.
     memory_allocator: TMemAlloc,
     // These fields are accessed through raw pointers in `vmctx`.
     _globals: Vec<u64>,
     _values: Vec<u64>,
     _code_alloc: PhantomData<TCodeAlloc>,
+}
+
+/// State of [`Instance::stack_ctx`].
+enum StackCtxState<TAlloc> {
+    /// `stack_ctx` doesn't contain a [`stack_switch::Context`]. Contains the allocator to
+    /// create one with.
+    Uninit(TAlloc),
+    /// `stack_ctx` contains a [`stack_switch::Context`].
+    Init,
+    /// `stack_ctx` doesn't contain a [`stack_switch::Context`], and the allocator has been lost
+    /// because allocating a stack has failed.
+    AllocationFailed,
 }
 
 enum InstanceState {
@@ -1114,8 +1129,8 @@ impl<
         TMemAlloc: Allocator,
     > Instance<TModule, TCodeAlloc, TStackAlloc, TMemAlloc>
 {
-    /// Instantiates the given module. Its native stack is allocated with `stack_allocator`, and
-    /// its linear memory with `memory_allocator`.
+    /// Instantiates the given module. Its native stack is allocated with `stack_allocator`, at
+    /// each call to [`Instance::call`], and its linear memory with `memory_allocator`.
     ///
     /// The stack is allocated through a [`WithStackGuard`] wrapping around `stack_allocator`,
     /// meaning that the memory obtained from `stack_allocator` must be readable and writable,
@@ -1166,16 +1181,7 @@ impl<
 
         let mut values = vec![0u64; module_ref.values_len];
 
-        let mut stack_ctx = Box::pin(
-            match stack_switch::Context::new(WithStackGuard::new(stack_allocator), STACK_LAYOUT) {
-                Ok(stack_ctx) => stack_ctx,
-                Err(_) => {
-                    // SAFETY: `memory` was allocated with `memory_allocator` and `mem_layout`.
-                    unsafe { memory_allocator.deallocate(memory, mem_layout) };
-                    return Err(Error::Allocation);
-                }
-            },
-        );
+        let mut stack_ctx = Box::into_pin(Box::new_uninit());
 
         let code_start = module_ref.code.as_ptr() as u64;
         let vmctx = Box::into_raw(Box::new(VmCtx {
@@ -1202,6 +1208,7 @@ impl<
             vmctx,
             state: InstanceState::Idle,
             stack_ctx,
+            stack_ctx_state: StackCtxState::Uninit(WithStackGuard::new(stack_allocator)),
             memory_allocator,
             _globals: globals,
             _values: values,
@@ -1218,28 +1225,50 @@ impl<
     /// Starts executing the exported function with the given name.
     ///
     /// If the execution of a previous call is suspended, it is discarded.
+    ///
+    /// A new native stack is allocated at each call, after the previous one has been freed.
+    /// Returns [`Error::Allocation`] if this allocation fails, in which case all the subsequent
+    /// calls to this function also return [`Error::Allocation`].
     pub fn call(&mut self, export: &str, args: &[Value]) -> Result<RunOutcome, Error> {
         let module = self.module.as_ref();
         let (func_idx, offset) = *module.exports.get(export).ok_or(Error::NoSuchExport)?;
         self.write_values(&module.funcs[func_idx as usize].params, args)?;
         self.state = InstanceState::Idle;
 
+        let stack_allocator = match mem::replace(
+            &mut self.stack_ctx_state,
+            StackCtxState::AllocationFailed,
+        ) {
+            StackCtxState::Uninit(allocator) => allocator,
+            // SAFETY: `stack_ctx` contains a context, and isn't being resumed.
+            StackCtxState::Init => unsafe {
+                stack_switch::Context::deinit(self.stack_ctx.as_mut())
+            },
+            StackCtxState::AllocationFailed => return Err(Error::Allocation),
+        };
+
         // SAFETY: the stack context and the `VmCtx` are boxed and outlive the execution, and
         // the stack isn't used by anything else.
         // The trampoline is a function with the signature
         // `extern "sysv64" fn(*mut VmCtx, *mut u64)`, and it doesn't unwind.
-        unsafe {
+        let result = unsafe {
             let trampoline = mem::transmute::<
                 *const u8,
                 unsafe extern "sysv64" fn(*mut VmCtx, *mut u64),
             >(module.code.add(offset).as_ptr());
-            stack_switch::prepare(
+            stack_switch::Context::new(
                 self.stack_ctx.as_mut(),
+                stack_allocator,
+                STACK_LAYOUT,
                 trampoline,
                 self.vmctx,
                 (*self.vmctx).values,
-            );
+            )
+        };
+        if result.is_err() {
+            return Err(Error::Allocation);
         }
+        self.stack_ctx_state = StackCtxState::Init;
 
         self.run(func_idx)
     }
@@ -1321,9 +1350,15 @@ impl<
         let module = self.module.as_ref();
 
         let previous = CURRENT_VMCTX.replace(vmctx);
-        // SAFETY: the stack is prepared by `Instance::call`, and `self.state` tracks whether the
-        // execution is suspended.
-        let outcome = unsafe { stack_switch::resume(self.stack_ctx.as_mut()) };
+        // SAFETY: the stack context is created by `Instance::call` before this function is
+        // called, and `self.state` tracks whether the execution is suspended.
+        let outcome = unsafe {
+            stack_switch::resume(
+                self.stack_ctx
+                    .as_mut()
+                    .map_unchecked_mut(|ctx| ctx.assume_init_mut()),
+            )
+        };
         CURRENT_VMCTX.set(previous);
 
         match outcome {
@@ -1360,7 +1395,8 @@ impl<
                 let pc = unsafe { (*vmctx).trap_pc };
 
                 let fault_addr = unsafe { (*vmctx).trap_addr };
-                let stack = self.stack_ctx.stack();
+                // SAFETY: the stack context has been created in order to run the fiber.
+                let stack = unsafe { self.stack_ctx.assume_init_ref() }.stack();
                 let stack_start = u64::try_from(stack.cast::<u8>().as_ptr().addr())
                     .unwrap_or_else(|_| unreachable!());
                 let guard_start = stack_start
@@ -1438,6 +1474,10 @@ impl<
     fn drop(&mut self) {
         // The Wasm stack contains no Rust frames, so a suspended execution can simply be
         // discarded.
+        if let StackCtxState::Init = self.stack_ctx_state {
+            // SAFETY: `stack_ctx` contains a context, and isn't being resumed.
+            drop(unsafe { stack_switch::Context::deinit(self.stack_ctx.as_mut()) });
+        }
         let vmctx = unsafe { Box::from_raw(self.vmctx) };
         // The memory was successfully allocated or grown with this layout.
         let mem_layout = Layout::from_size_align(

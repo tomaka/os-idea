@@ -7,10 +7,10 @@
 //!
 //! # Lifecycle
 //!
-//! 1. Create a [`Context`] with [`Context::new`], which allocates the fiber stack, and pin it.
-//! 2. Call [`prepare`], passing a function (the *entry point*) together with two arguments for
-//!    it. This doesn't run anything.
-//! 3. Call [`resume`]. This switches to the fiber stack and runs the fiber until one of the
+//! 1. Create a [`Context`] in a pinned [`MaybeUninit`] with [`Context::new`], passing a
+//!    function (the *entry point*) together with two arguments for it. This allocates the fiber
+//!    stack, but doesn't run anything.
+//! 2. Call [`resume`]. This switches to the fiber stack and runs the fiber until one of the
 //!    following happens, which makes [`resume`] return:
 //!    - The entry point returns. [`resume`] returns [`Outcome::Finished`].
 //!    - The fiber calls [`stack_switch_yield`]. [`resume`] returns [`Outcome::Yielded`]. A later
@@ -18,10 +18,11 @@
 //!      it was suspended.
 //!    - The execution jumps to [`stack_switch_abandon`], typically from a signal handler that
 //!      modified the interrupted context. [`resume`] returns [`Outcome::Abandoned`].
-//! 4. After [`Outcome::Finished`] or [`Outcome::Abandoned`], the [`Context`] can be prepared
-//!    again with [`prepare`]. The same stack is reused.
+//! 3. After [`Outcome::Finished`] or [`Outcome::Abandoned`], the [`Context`] can be freed with
+//!    [`Context::deinit`], which returns the allocator, and a new [`Context`] can then be
+//!    created in the same location.
 //!
-//! Dropping the [`Context`] frees the fiber stack.
+//! Dropping the [`Context`] or passing it to [`Context::deinit`] frees the fiber stack.
 //!
 //! # What is switched and what isn't
 //!
@@ -34,7 +35,7 @@
 //! and both sides must leave them in the state required by the ABI.
 //!
 //! Nothing that lives on the fiber stack is ever dropped by this module. When a fiber is
-//! abandoned, or prepared again while suspended, the content of its stack is simply forgotten.
+//! abandoned, or freed while suspended, the content of its stack is simply forgotten.
 //!
 //! Panics must never unwind through a switch. In other words, the entry point of a fiber must
 //! never unwind.
@@ -47,9 +48,9 @@ use core::{
     arch::global_asm,
     fmt,
     marker::PhantomPinned,
-    mem::offset_of,
+    mem::{offset_of, MaybeUninit},
     pin::Pin,
-    ptr::NonNull,
+    ptr::{self, NonNull},
 };
 
 /// Stack of a fiber, and stack pointers of the main side and of the fiber side, each saved while
@@ -58,7 +59,7 @@ use core::{
 /// The stack is allocated with `TAlloc` when the [`Context`] is created, and deallocated when it
 /// is dropped.
 ///
-/// [`prepare`] and [`resume`] take a pinned [`Context`], as the fiber keeps a pointer to it.
+/// [`Context::new`] and [`resume`] take a pinned [`Context`], as the fiber keeps a pointer to it.
 // The assembly code accesses `main_rsp` and `fiber_rsp`. Since they come before any field whose
 // type depends on `TAlloc`, `repr(C)` guarantees that their offsets are the same whatever
 // `TAlloc` is.
@@ -77,8 +78,15 @@ pub struct Context<TAlloc: Allocator> {
 }
 
 impl<TAlloc: Allocator> Context<TAlloc> {
-    /// Allocates a fiber stack with `allocator` and `stack_layout`, and returns a new
-    /// [`Context`] that owns it and that has not been prepared yet.
+    /// Allocates a fiber stack with `allocator` and `stack_layout`, and initializes `slot` with
+    /// a [`Context`] that owns it, prepared so that the first call to [`resume`] calls
+    /// `entry_point(arg0, arg1)` on the fiber stack.
+    ///
+    /// This function doesn't run anything and doesn't switch stacks. It only writes a frame of
+    /// 72 bytes at the top of the fiber stack and records its location in the [`Context`].
+    ///
+    /// If `slot` already contains a [`Context`], it is overwritten without being dropped. Use
+    /// [`Context::deinit`] beforehand in order to free its stack.
     ///
     /// The memory returned by `allocator` must be readable and writable.
     ///
@@ -90,20 +98,88 @@ impl<TAlloc: Allocator> Context<TAlloc> {
     ///
     /// Panics if the alignment of `stack_layout` is less than 16, if its size isn't a multiple
     /// of 16, or if its size is less than 72 bytes.
-    pub fn new(allocator: TAlloc, stack_layout: Layout) -> Result<Self, AllocError> {
+    ///
+    /// # Safety
+    ///
+    /// - The fiber stack must not be accessed by anything other than the fiber until the fiber
+    ///   is finished or abandoned.
+    /// - `entry_point` must never unwind, and it must be sound to call it with `arg0` and `arg1`
+    ///   as parameters.
+    pub unsafe fn new<T, U>(
+        slot: Pin<&mut MaybeUninit<Self>>,
+        allocator: TAlloc,
+        stack_layout: Layout,
+        entry_point: unsafe extern "sysv64" fn(*mut T, *mut U),
+        arg0: *mut T,
+        arg1: *mut U,
+    ) -> Result<Pin<&mut Self>, AllocError> {
         assert!(stack_layout.align() >= 16);
         assert!(stack_layout.size().is_multiple_of(16));
-        // The frame written by `prepare` is 72 bytes.
+        // The frame written below is 72 bytes.
         assert!(stack_layout.size() >= 72);
         let stack = allocator.allocate(stack_layout)?.cast::<u8>();
-        Ok(Context {
+
+        // SAFETY: nothing is moved out of `slot`.
+        let slot = unsafe { Pin::get_unchecked_mut(slot) };
+        // SAFETY: the stack is `stack_layout.size()` bytes long.
+        let stack_top = unsafe { stack.add(stack_layout.size()) };
+        debug_assert!(stack_top.as_ptr().addr().is_multiple_of(16));
+
+        // Frame popped by the raw switch when the fiber is resumed for the first time: the
+        // callee-saved registers, then the address `ret` jumps to. The two last slots keep the
+        // stack pointer aligned on 16 bytes when `stack_switch_fiber_start` calls the entry
+        // point.
+        let frame = [
+            slot.as_mut_ptr().addr(),                       // r15
+            (entry_point as *const ()).addr(),              // r14
+            arg1.addr(),                                    // r13
+            arg0.addr(),                                    // r12
+            0,                                              // rbx
+            0,                                              // rbp
+            (stack_switch_fiber_start as *const ()).addr(), // return address
+            0,
+            0,
+        ];
+        // SAFETY: the stack is large enough for the frame as checked above.
+        let frame_start = unsafe {
+            let frame_start = stack_top.as_ptr().cast::<usize>().sub(frame.len());
+            frame_start.copy_from_nonoverlapping(frame.as_ptr(), frame.len());
+            frame_start
+        };
+
+        let ctx = slot.write(Context {
             main_rsp: 0,
-            fiber_rsp: 0,
+            fiber_rsp: frame_start.addr(),
             stack,
             stack_layout,
             allocator,
             _pinned: PhantomPinned,
-        })
+        });
+        // SAFETY: `ctx` is inside of `slot`, which is pinned.
+        Ok(unsafe { Pin::new_unchecked(ctx) })
+    }
+
+    /// Frees the fiber stack of the [`Context`] contained in `slot`, and returns its allocator.
+    /// `slot` no longer contains a [`Context`] afterwards.
+    ///
+    /// Nothing that lives on the fiber stack is dropped.
+    ///
+    /// # Safety
+    ///
+    /// - `slot` must contain a [`Context`].
+    /// - This [`Context`] must not currently be being resumed.
+    pub unsafe fn deinit(slot: Pin<&mut MaybeUninit<Self>>) -> TAlloc {
+        // SAFETY: nothing is moved out of `slot`.
+        let ctx = unsafe { Pin::get_unchecked_mut(slot) }.as_mut_ptr();
+        // SAFETY: the caller guarantees that `slot` contains a `Context`. Its content is
+        // considered uninitialized afterwards, so the allocator is never duplicated. Since the
+        // fiber can't run anymore, nothing points to the `Context`.
+        unsafe {
+            let allocator = ptr::read(&raw const (*ctx).allocator);
+            // `stack` was allocated with `allocator` and `stack_layout`.
+            allocator.deallocate((*ctx).stack, (*ctx).stack_layout);
+            allocator
+        }
     }
 
     /// Returns the memory of the fiber stack. The fiber stack grows downwards, starting from the
@@ -130,66 +206,14 @@ impl<TAlloc: Allocator> fmt::Debug for Context<TAlloc> {
 /// Reason why [`resume`] has returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// The entry point of the fiber has returned. The [`Context`] must be passed to [`prepare`]
-    /// again before it can be resumed.
+    /// The entry point of the fiber has returned. The [`Context`] can no longer be
+    /// resumed.
     Finished,
     /// The fiber has called [`stack_switch_yield`]. It can be continued with [`resume`].
     Yielded,
-    /// The execution has jumped to [`stack_switch_abandon`]. The [`Context`] must be passed to
-    /// [`prepare`] again before it can be resumed.
+    /// The execution has jumped to [`stack_switch_abandon`]. The [`Context`] can no
+    /// longer be resumed.
     Abandoned,
-}
-
-/// Prepares `ctx` so that the next call to [`resume`] calls `entry_point(arg0, arg1)` on the
-/// fiber stack of `ctx`.
-///
-/// This function doesn't run anything and doesn't switch stacks. It only writes a frame of
-/// 72 bytes at the top of the fiber stack and records its location in `ctx`.
-///
-/// If `ctx` was already prepared, or if its fiber was suspended, the previous fiber is discarded
-/// without anything on its stack being dropped.
-///
-/// # Safety
-///
-/// - `ctx` must not currently be being resumed.
-/// - The fiber stack of `ctx` must not be accessed by anything other than the fiber until the
-///   fiber is finished or abandoned.
-/// - `entry_point` must never unwind, and it must be sound to call it with `arg0` and `arg1` as
-///   parameters.
-pub unsafe fn prepare<TAlloc: Allocator, T, U>(
-    ctx: Pin<&mut Context<TAlloc>>,
-    entry_point: unsafe extern "sysv64" fn(*mut T, *mut U),
-    arg0: *mut T,
-    arg1: *mut U,
-) {
-    // SAFETY: nothing is moved out of `ctx`.
-    let ctx = unsafe { Pin::get_unchecked_mut(ctx) };
-    // SAFETY: the stack is `stack_layout.size()` bytes long.
-    let stack_top = unsafe { ctx.stack.add(ctx.stack_layout.size()) };
-    debug_assert!(stack_top.as_ptr().addr().is_multiple_of(16));
-
-    // Frame popped by the raw switch when the fiber is resumed for the first time: the
-    // callee-saved registers, then the address `ret` jumps to. The two last slots keep the stack
-    // pointer aligned on 16 bytes when `stack_switch_fiber_start` calls the entry point.
-    let frame = [
-        (&raw mut *ctx).addr(),                         // r15
-        (entry_point as *const ()).addr(),              // r14
-        arg1.addr(),                                    // r13
-        arg0.addr(),                                    // r12
-        0,                                              // rbx
-        0,                                              // rbp
-        (stack_switch_fiber_start as *const ()).addr(), // return address
-        0,
-        0,
-    ];
-    // SAFETY: the stack is writable, and `Context::new` checks that it is large enough for the
-    // frame.
-    let frame_start = unsafe {
-        let frame_start = stack_top.as_ptr().cast::<usize>().sub(frame.len());
-        frame_start.copy_from_nonoverlapping(frame.as_ptr(), frame.len());
-        frame_start
-    };
-    ctx.fiber_rsp = frame_start.addr();
 }
 
 /// Switches to the fiber stack of `ctx` and runs the fiber until it finishes, yields, or is
@@ -199,8 +223,8 @@ pub unsafe fn prepare<TAlloc: Allocator, T, U>(
 ///
 /// # Safety
 ///
-/// - `ctx` must have been passed to [`prepare`], and since then [`resume`] must either have never
-///   been called with it or have last returned [`Outcome::Yielded`].
+/// - Since `ctx` has been created, [`resume`] must either have never been called with it or have
+///   last returned [`Outcome::Yielded`].
 /// - `ctx` must not currently be being resumed. In particular, the fiber of `ctx` must not call
 ///   [`resume`] with `ctx`.
 /// - Running the fiber until it yields, finishes, or is abandoned must be sound.
@@ -249,7 +273,7 @@ global_asm!(
     // `stack_switch_fiber_start`
     //
     // Reached through the `ret` of `stack_switch_raw` when switching to a stack prepared by
-    // `prepare`, with `r12` = first argument, `r13` = second argument, `r14` = entry point,
+    // `Context::new`, with `r12` = first argument, `r13` = second argument, `r14` = entry point,
     // `r15` = context. `r15` is callee-saved, and thus still contains the context after the
     // entry point returns.
     ".p2align 4",
