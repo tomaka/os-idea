@@ -48,6 +48,7 @@ use core::{
     fmt,
     marker::PhantomData,
     mem::{self, offset_of},
+    pin::Pin,
     ptr::{self, NonNull},
     slice,
 };
@@ -58,15 +59,16 @@ use crate::alloc_stack_guard::{self, WithStackGuard};
 mod stack_switch;
 
 use cranelift_codegen::{
-    Context, FinalizedRelocTarget,
     binemit::Reloc,
     control::ControlPlane,
     ir::{
-        self, AbiParam, BlockArg, BlockCall, ExtFuncData, ExternalName, InstBuilder, JumpTableData,
-        MemFlagsData, Signature, TrapCode, UserExternalName, UserFuncName, condcodes::IntCC, types,
+        self, condcodes::IntCC, types, AbiParam, BlockArg, BlockCall, ExtFuncData, ExternalName,
+        InstBuilder, JumpTableData, MemFlagsData, Signature, TrapCode, UserExternalName,
+        UserFuncName,
     },
     isa::{CallConv, OwnedTargetIsa},
     settings::{self, Configurable as _},
+    Context, FinalizedRelocTarget,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use wasmparser::{BlockType, FuncType, Operator, Payload, ValType};
@@ -1086,9 +1088,8 @@ pub struct Instance<
     /// pointer.
     vmctx: *mut VmCtx,
     state: InstanceState,
-    /// Native stack on which the Wasm code runs, allocated with [`STACK_LAYOUT`]. Obtained from
-    /// `Box::into_raw`, as the fiber and `vmctx` keep pointers to it.
-    stack_ctx: *mut stack_switch::Context<WithStackGuard<TStackAlloc>>,
+    /// Native stack on which the Wasm code runs, allocated with [`STACK_LAYOUT`].
+    stack_ctx: Pin<Box<stack_switch::Context<WithStackGuard<TStackAlloc>>>>,
     /// Allocator of the linear memory.
     memory_allocator: TMemAlloc,
     // These fields are accessed through raw pointers in `vmctx`.
@@ -1107,11 +1108,11 @@ enum InstanceState {
 }
 
 impl<
-    TModule: AsRef<Module<TCodeAlloc>>,
-    TCodeAlloc: Allocator,
-    TStackAlloc: Allocator,
-    TMemAlloc: Allocator,
-> Instance<TModule, TCodeAlloc, TStackAlloc, TMemAlloc>
+        TModule: AsRef<Module<TCodeAlloc>>,
+        TCodeAlloc: Allocator,
+        TStackAlloc: Allocator,
+        TMemAlloc: Allocator,
+    > Instance<TModule, TCodeAlloc, TStackAlloc, TMemAlloc>
 {
     /// Instantiates the given module. Its native stack is allocated with `stack_allocator`, and
     /// its linear memory with `memory_allocator`.
@@ -1165,15 +1166,16 @@ impl<
 
         let mut values = vec![0u64; module_ref.values_len];
 
-        let stack_ctx =
+        let mut stack_ctx = Box::pin(
             match stack_switch::Context::new(WithStackGuard::new(stack_allocator), STACK_LAYOUT) {
-                Ok(stack_ctx) => Box::into_raw(Box::new(stack_ctx)),
+                Ok(stack_ctx) => stack_ctx,
                 Err(_) => {
                     // SAFETY: `memory` was allocated with `memory_allocator` and `mem_layout`.
                     unsafe { memory_allocator.deallocate(memory, mem_layout) };
                     return Err(Error::Allocation);
                 }
-            };
+            },
+        );
 
         let code_start = module_ref.code.as_ptr() as u64;
         let vmctx = Box::into_raw(Box::new(VmCtx {
@@ -1188,7 +1190,9 @@ impl<
             trap_signal: 0,
             trap_pc: 0,
             trap_addr: 0,
-            stack_ctx: stack_ctx.cast::<()>(),
+            // SAFETY: nothing is moved out of `stack_ctx`.
+            stack_ctx: (&raw mut *unsafe { Pin::get_unchecked_mut(stack_ctx.as_mut()) })
+                .cast::<()>(),
             code_start,
             code_end: code_start + module_ref.code_layout.size() as u64,
         }));
@@ -1229,7 +1233,12 @@ impl<
                 *const u8,
                 unsafe extern "sysv64" fn(*mut VmCtx, *mut u64),
             >(module.code.add(offset).as_ptr());
-            stack_switch::prepare(self.stack_ctx, trampoline, self.vmctx, (*self.vmctx).values);
+            stack_switch::prepare(
+                self.stack_ctx.as_mut(),
+                trampoline,
+                self.vmctx,
+                (*self.vmctx).values,
+            );
         }
 
         self.run(func_idx)
@@ -1314,7 +1323,7 @@ impl<
         let previous = CURRENT_VMCTX.replace(vmctx);
         // SAFETY: the stack is prepared by `Instance::call`, and `self.state` tracks whether the
         // execution is suspended.
-        let outcome = unsafe { stack_switch::resume(self.stack_ctx) };
+        let outcome = unsafe { stack_switch::resume(self.stack_ctx.as_mut()) };
         CURRENT_VMCTX.set(previous);
 
         match outcome {
@@ -1351,8 +1360,7 @@ impl<
                 let pc = unsafe { (*vmctx).trap_pc };
 
                 let fault_addr = unsafe { (*vmctx).trap_addr };
-                // SAFETY: the stack context is valid, and the fiber isn't running.
-                let stack = unsafe { (*self.stack_ctx).stack() };
+                let stack = self.stack_ctx.stack();
                 let stack_start = u64::try_from(stack.cast::<u8>().as_ptr().addr())
                     .unwrap_or_else(|_| unreachable!());
                 let guard_start = stack_start
@@ -1421,11 +1429,11 @@ impl<
 }
 
 impl<
-    TModule: AsRef<Module<TCodeAlloc>>,
-    TCodeAlloc: Allocator,
-    TStackAlloc: Allocator,
-    TMemAlloc: Allocator,
-> Drop for Instance<TModule, TCodeAlloc, TStackAlloc, TMemAlloc>
+        TModule: AsRef<Module<TCodeAlloc>>,
+        TCodeAlloc: Allocator,
+        TStackAlloc: Allocator,
+        TMemAlloc: Allocator,
+    > Drop for Instance<TModule, TCodeAlloc, TStackAlloc, TMemAlloc>
 {
     fn drop(&mut self) {
         // The Wasm stack contains no Rust frames, so a suspended execution can simply be
@@ -1439,8 +1447,6 @@ impl<
         .unwrap_or_else(|_| unreachable!());
         // SAFETY: `mem_base` was allocated with `memory_allocator` and `mem_layout`.
         unsafe { self.memory_allocator.deallocate(vmctx.mem_base, mem_layout) };
-        // SAFETY: `stack_ctx` was obtained from `Box::into_raw`, and the fiber isn't running.
-        drop(unsafe { Box::from_raw(self.stack_ctx) });
     }
 }
 
