@@ -18,6 +18,16 @@ pub struct Executor<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Al
     /// Interfaces implemented natively by the host. See
     /// [`ExecutorBuilder::register_native_interface`].
     native_interfaces: hashbrown::HashSet<[u8; 32], fnv::FnvBuildHasher>,
+    /// Delivery queue of each instance, indexed by public key of the instance.
+    // TODO: entries are never removed, even when the instance is destroyed
+    // TODO: do better than a spin::Mutex
+    delivery_queues: spin::Mutex<
+        hashbrown::HashMap<
+            [u8; 32],
+            Arc<crossbeam_queue::SegQueue<PendingDelivery<TCodeAlloc, TStackAlloc, TMemAlloc>>>,
+            fnv::FnvBuildHasher,
+        >,
+    >,
 }
 
 /// Prototype for an [`Executor`].
@@ -54,6 +64,9 @@ impl ExecutorBuilder {
             ready: crossbeam_queue::SegQueue::new(),
             trap_handlers: self.trap_handlers,
             native_interfaces: self.native_interfaces,
+            delivery_queues: spin::Mutex::new(hashbrown::HashMap::with_hasher(
+                fnv::FnvBuildHasher::default(),
+            )),
         }
     }
 }
@@ -75,39 +88,41 @@ enum ReadyStatus {
     /// delivered. The call must return.
     MessageDelivered,
     /// The instance is suspended in a call to an imported function of type
-    /// [`ModuleImport::Request`], and the request must be sent.
-    SendingRequest {
+    /// [`ModuleImport::Request`] on an interface implemented natively, and the request must be
+    /// sent.
+    SendingNativeInterfaceRequest {
         /// Interface the request is sent on.
-        // TODO: not used yet, as message delivery isn't implemented
+        // TODO: not used yet, as native interfaces aren't implemented
         #[expect(dead_code)]
         interface: [u8; 32],
         /// Offset in the linear memory of the instance of the buffer containing the request.
-        // TODO: not used yet, as message delivery isn't implemented
+        // TODO: not used yet, as native interfaces aren't implemented
         #[expect(dead_code)]
         buffer_ptr: u32,
         /// Size in bytes of the buffer containing the request. The range
         /// `buffer_ptr..buffer_ptr + buffer_len` is always within the bounds of the linear
         /// memory, as the linear memory can only grow.
-        // TODO: not used yet, as message delivery isn't implemented
+        // TODO: not used yet, as native interfaces aren't implemented
         #[expect(dead_code)]
         buffer_len: u32,
     },
     /// The instance is suspended in a call to an imported function of type
-    /// [`ModuleImport::Notification`], and the notification must be sent.
-    SendingNotification {
+    /// [`ModuleImport::Notification`] on an interface implemented natively, and the
+    /// notification must be sent.
+    SendingNativeInterfaceNotification {
         /// Interface the notification is sent on.
-        // TODO: not used yet, as message delivery isn't implemented
+        // TODO: not used yet, as native interfaces aren't implemented
         #[expect(dead_code)]
         interface: [u8; 32],
         /// Offset in the linear memory of the instance of the buffer containing the
         /// notification.
-        // TODO: not used yet, as message delivery isn't implemented
+        // TODO: not used yet, as native interfaces aren't implemented
         #[expect(dead_code)]
         buffer_ptr: u32,
         /// Size in bytes of the buffer containing the notification. The range
         /// `buffer_ptr..buffer_ptr + buffer_len` is always within the bounds of the linear
         /// memory, as the linear memory can only grow.
-        // TODO: not used yet, as message delivery isn't implemented
+        // TODO: not used yet, as native interfaces aren't implemented
         #[expect(dead_code)]
         buffer_len: u32,
     },
@@ -157,11 +172,13 @@ struct Instance<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Alloca
     // TODO: not used yet
     #[expect(dead_code)]
     public_key: [u8; 32],
-    /// Public key of the program handling each interface used by the module, indexed by
+    /// Delivery queue of the instance handling each interface used by the module, indexed by
     /// interface. Doesn't contain the interfaces implemented natively.
-    // TODO: not used yet, as message delivery isn't implemented
-    #[expect(dead_code)]
-    interface_handlers: hashbrown::HashMap<[u8; 32], [u8; 32], fnv::FnvBuildHasher>,
+    interface_handlers: hashbrown::HashMap<
+        [u8; 32],
+        Arc<crossbeam_queue::SegQueue<PendingDelivery<TCodeAlloc, TStackAlloc, TMemAlloc>>>,
+        fnv::FnvBuildHasher,
+    >,
     /// Messages waiting to be delivered to this instance.
     pending_delivery:
         Arc<crossbeam_queue::SegQueue<PendingDelivery<TCodeAlloc, TStackAlloc, TMemAlloc>>>,
@@ -208,10 +225,9 @@ impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
                 });
                 return;
             }
-            // TODO: message delivery isn't implemented, the instance is currently destroyed
-            ReadyStatus::SendingRequest { .. } | ReadyStatus::SendingNotification { .. } => {
-                return;
-            }
+            // TODO: native interfaces aren't implemented, the instance is currently destroyed
+            ReadyStatus::SendingNativeInterfaceRequest { .. }
+            | ReadyStatus::SendingNativeInterfaceNotification { .. } => return,
         };
 
         loop {
@@ -246,25 +262,57 @@ impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
                     {
                         return;
                     }
-                    let status = match *import {
-                        ModuleImport::Request { interface } => ReadyStatus::SendingRequest {
-                            interface,
-                            buffer_ptr,
-                            buffer_len,
-                        },
-                        ModuleImport::Notification { interface } => {
-                            ReadyStatus::SendingNotification {
-                                interface,
+                    match *import {
+                        ModuleImport::Request { interface }
+                            if self.native_interfaces.contains(&interface) =>
+                        {
+                            self.ready.push(ReadyInstance {
+                                instance,
+                                status: ReadyStatus::SendingNativeInterfaceRequest {
+                                    interface,
+                                    buffer_ptr,
+                                    buffer_len,
+                                },
+                            });
+                        }
+                        ModuleImport::Notification { interface }
+                            if self.native_interfaces.contains(&interface) =>
+                        {
+                            self.ready.push(ReadyInstance {
+                                instance,
+                                status: ReadyStatus::SendingNativeInterfaceNotification {
+                                    interface,
+                                    buffer_ptr,
+                                    buffer_len,
+                                },
+                            });
+                        }
+                        ModuleImport::Request { interface }
+                        | ModuleImport::Notification { interface } => {
+                            // `InstanceBuilder::build` makes sure that all the interfaces used
+                            // by the module are either implemented natively or have a handler.
+                            let queue = Arc::clone(
+                                instance
+                                    .interface_handlers
+                                    .get(&interface)
+                                    .unwrap_or_else(|| unreachable!()),
+                            );
+                            queue.push(PendingDelivery {
+                                instance,
                                 buffer_ptr,
                                 buffer_len,
-                            }
+                            });
                         }
-                        ModuleImport::WaitForMessage => ReadyStatus::WaitingForMessage {
-                            buffer_ptr,
-                            buffer_len,
-                        },
-                    };
-                    self.ready.push(ReadyInstance { instance, status });
+                        ModuleImport::WaitForMessage => {
+                            self.ready.push(ReadyInstance {
+                                instance,
+                                status: ReadyStatus::WaitingForMessage {
+                                    buffer_ptr,
+                                    buffer_len,
+                                },
+                            });
+                        }
+                    }
                     return;
                 }
                 Ok(low_level_vm::RunOutcome::MemoryGrow { delta }) => {
@@ -505,8 +553,9 @@ impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
     /// Registers the program whose public key is `handler_public_key` as the handler of the
     /// messages that the instance sends on `interface`.
     ///
-    /// Each interface must be registered at most once, and must not be implemented natively
-    /// by the executor. This is checked by [`InstanceBuilder::build`]. Registering an interface
+    /// Each interface must be registered at most once, must not be implemented natively by the
+    /// executor, and the handler must have already been instantiated in the executor. This is
+    /// checked by [`InstanceBuilder::build`]. Registering an interface
     /// that the module doesn't use is allowed.
     #[inline]
     pub fn register_interface_handler(
@@ -526,13 +575,22 @@ impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
     /// [`InstanceBuilder::register_interface_handler`], or if it has been registered while
     /// being implemented natively by the executor (see
     /// [`ExecutorBuilder::register_native_interface`]), or if an interface used by the module
-    /// is neither implemented natively nor registered. Also returns an error if allocating the
+    /// is neither implemented natively nor registered, or if the handler of an interface hasn't
+    /// been instantiated in the executor, or if an instance with the same public key has
+    /// already been instantiated in the executor. Also returns an error if allocating the
     /// linear memory of the instance fails, or if a data segment of the module doesn't fit in
     /// its linear memory.
     pub fn build(
         self,
         executor: &Executor<TCodeAlloc, TStackAlloc, TMemAlloc>,
     ) -> Result<(), InstanceBuilderError> {
+        // The lock is held until the end of the function, so that no other instance with the
+        // same public key can be registered in the meantime.
+        let mut delivery_queues = executor.delivery_queues.lock();
+        if delivery_queues.contains_key(&self.public_key) {
+            return Err(InstanceBuilderError::DuplicatePublicKey);
+        }
+
         let mut interface_handlers = hashbrown::HashMap::with_capacity_and_hasher(
             self.interface_handlers.len(),
             fnv::FnvBuildHasher::default(),
@@ -541,8 +599,14 @@ impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
             if executor.native_interfaces.contains(&interface) {
                 return Err(InstanceBuilderError::NativeInterfaceHandler { interface });
             }
+            let Some(queue) = delivery_queues.get(&handler_public_key) else {
+                return Err(InstanceBuilderError::UnknownInterfaceHandler {
+                    interface,
+                    handler_public_key,
+                });
+            };
             if interface_handlers
-                .insert(interface, handler_public_key)
+                .insert(interface, Arc::clone(queue))
                 .is_some()
             {
                 return Err(InstanceBuilderError::DuplicateInterfaceHandler { interface });
@@ -572,13 +636,16 @@ impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
         )
         .map_err(InstanceBuilderError::Vm)?;
 
+        let pending_delivery = Arc::new(crossbeam_queue::SegQueue::new());
+        delivery_queues.insert(self.public_key, Arc::clone(&pending_delivery));
+
         executor.ready.push(ReadyInstance {
             instance: Instance {
                 vm,
                 imports: self.module.imports,
                 public_key: self.public_key,
                 interface_handlers,
-                pending_delivery: Arc::new(crossbeam_queue::SegQueue::new()),
+                pending_delivery,
             },
             status: ReadyStatus::NotStarted,
         });
@@ -608,6 +675,16 @@ pub enum InstanceBuilderError {
         /// The offending interface.
         interface: [u8; 32],
     },
+    /// The program registered with [`InstanceBuilder::register_interface_handler`] as the
+    /// handler of the interface hasn't been instantiated in the executor.
+    UnknownInterfaceHandler {
+        /// The offending interface.
+        interface: [u8; 32],
+        /// Public key of the handler that hasn't been instantiated.
+        handler_public_key: [u8; 32],
+    },
+    /// An instance with the same public key has already been instantiated in the executor.
+    DuplicatePublicKey,
     /// Failed to instantiate the module.
     // TODO: don't expose low_level_vm::Error
     Vm(low_level_vm::Error),
@@ -625,6 +702,23 @@ impl fmt::Display for InstanceBuilderError {
             ),
             InstanceBuilderError::MissingInterfaceHandler { interface } => {
                 ("no handler for interface", interface)
+            }
+            InstanceBuilderError::UnknownInterfaceHandler {
+                interface,
+                handler_public_key,
+            } => {
+                write!(f, "handler of interface ")?;
+                for byte in interface {
+                    write!(f, "{byte:02x}")?;
+                }
+                write!(f, " not instantiated: ")?;
+                for byte in handler_public_key {
+                    write!(f, "{byte:02x}")?;
+                }
+                return Ok(());
+            }
+            InstanceBuilderError::DuplicatePublicKey => {
+                return write!(f, "instance with the same public key already exists");
             }
             InstanceBuilderError::Vm(err) => return fmt::Display::fmt(err, f),
         };
