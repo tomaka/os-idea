@@ -72,10 +72,41 @@ enum ReadyStatus {
     NotStarted,
     /// The instance is suspended in a call to an imported function of type
     /// [`ModuleImport::Request`], and the request must be sent.
-    SendingRequest,
+    SendingRequest {
+        /// Interface the request is sent on.
+        // TODO: not used yet, as message delivery isn't implemented
+        #[expect(dead_code)]
+        interface: [u8; 32],
+        /// Offset in the linear memory of the instance of the buffer containing the request.
+        // TODO: not used yet, as message delivery isn't implemented
+        #[expect(dead_code)]
+        buffer_ptr: u32,
+        /// Size in bytes of the buffer containing the request. The range
+        /// `buffer_ptr..buffer_ptr + buffer_len` is always within the bounds of the linear
+        /// memory, as the linear memory can only grow.
+        // TODO: not used yet, as message delivery isn't implemented
+        #[expect(dead_code)]
+        buffer_len: u32,
+    },
     /// The instance is suspended in a call to an imported function of type
     /// [`ModuleImport::Notification`], and the notification must be sent.
-    SendingNotification,
+    SendingNotification {
+        /// Interface the notification is sent on.
+        // TODO: not used yet, as message delivery isn't implemented
+        #[expect(dead_code)]
+        interface: [u8; 32],
+        /// Offset in the linear memory of the instance of the buffer containing the
+        /// notification.
+        // TODO: not used yet, as message delivery isn't implemented
+        #[expect(dead_code)]
+        buffer_ptr: u32,
+        /// Size in bytes of the buffer containing the notification. The range
+        /// `buffer_ptr..buffer_ptr + buffer_len` is always within the bounds of the linear
+        /// memory, as the linear memory can only grow.
+        // TODO: not used yet, as message delivery isn't implemented
+        #[expect(dead_code)]
+        buffer_len: u32,
+    },
     /// The instance is suspended in a call to an imported function of type
     /// [`ModuleImport::WaitForMessage`], and is waiting for a message to be delivered to it.
     WaitingForMessage {
@@ -136,8 +167,8 @@ impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
         let mut outcome = match status {
             ReadyStatus::NotStarted => instance.vm.call("main", &[]),
             // TODO: message delivery isn't implemented, the instance is currently destroyed
-            ReadyStatus::SendingRequest
-            | ReadyStatus::SendingNotification
+            ReadyStatus::SendingRequest { .. }
+            | ReadyStatus::SendingNotification { .. }
             | ReadyStatus::WaitingForMessage { .. } => return,
         };
 
@@ -153,35 +184,43 @@ impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
                         .ok()
                         .and_then(|import| instance.imports.get(import))
                         .unwrap_or_else(|| unreachable!());
-                    let status = match import {
-                        ModuleImport::Request { .. } => ReadyStatus::SendingRequest,
-                        ModuleImport::Notification { .. } => ReadyStatus::SendingNotification,
-                        ModuleImport::WaitForMessage => {
-                            // The signature of the import has been checked when building the
-                            // module.
-                            let [
-                                low_level_vm::Value::I32(buffer_ptr),
-                                low_level_vm::Value::I32(buffer_len),
-                            ] = args[..]
-                            else {
-                                unreachable!()
-                            };
-                            let buffer_ptr = buffer_ptr.cast_unsigned();
-                            let buffer_len = buffer_len.cast_unsigned();
-                            // TODO: report the error somehow
-                            if usize::try_from(buffer_ptr)
-                                .ok()
-                                .zip(usize::try_from(buffer_len).ok())
-                                .and_then(|(ptr, len)| instance.vm.memory().get(ptr..)?.get(..len))
-                                .is_none()
-                            {
-                                return;
-                            }
-                            ReadyStatus::WaitingForMessage {
+                    // All the imports have the signature `(i32, i32)`, which has been checked
+                    // when building the module.
+                    let [
+                        low_level_vm::Value::I32(buffer_ptr),
+                        low_level_vm::Value::I32(buffer_len),
+                    ] = args[..]
+                    else {
+                        unreachable!()
+                    };
+                    let buffer_ptr = buffer_ptr.cast_unsigned();
+                    let buffer_len = buffer_len.cast_unsigned();
+                    // TODO: report the error somehow
+                    if usize::try_from(buffer_ptr)
+                        .ok()
+                        .zip(usize::try_from(buffer_len).ok())
+                        .and_then(|(ptr, len)| instance.vm.memory().get(ptr..)?.get(..len))
+                        .is_none()
+                    {
+                        return;
+                    }
+                    let status = match *import {
+                        ModuleImport::Request { interface } => ReadyStatus::SendingRequest {
+                            interface,
+                            buffer_ptr,
+                            buffer_len,
+                        },
+                        ModuleImport::Notification { interface } => {
+                            ReadyStatus::SendingNotification {
+                                interface,
                                 buffer_ptr,
                                 buffer_len,
                             }
                         }
+                        ModuleImport::WaitForMessage => ReadyStatus::WaitingForMessage {
+                            buffer_ptr,
+                            buffer_len,
+                        },
                     };
                     self.ready.push(ReadyInstance { instance, status });
                     return;
@@ -226,7 +265,8 @@ impl<'a, TCodeAlloc: Allocator> ModuleBuilder<'a, TCodeAlloc> {
     /// the interface, and must be named either `request` or `notification`, or must be in a Wasm
     /// module named `interface` and be named `wait_for_message`.
     ///
-    /// The `wait_for_message` function must have the signature `(i32, i32) -> i32`.
+    /// The `wait_for_message` function must have the signature `(i32, i32) -> i32`, and the
+    /// `request` and `notification` functions must have the signature `(i32, i32) -> ()`.
     pub fn build(self) -> Result<Module<TCodeAlloc>, ModuleBuilderError> {
         let inner = self.inner.build().map_err(ModuleBuilderError::Vm)?;
 
@@ -267,11 +307,10 @@ impl<'a, TCodeAlloc: Allocator> ModuleBuilder<'a, TCodeAlloc> {
                     &[low_level_vm::ValueType::I32, low_level_vm::ValueType::I32],
                     &[low_level_vm::ValueType::I32],
                 ),
-                // TODO: the signature of these functions isn't decided yet
-                ModuleImport::Request { .. } | ModuleImport::Notification { .. } => {
-                    imports.push(import);
-                    continue;
-                }
+                ModuleImport::Request { .. } | ModuleImport::Notification { .. } => (
+                    &[low_level_vm::ValueType::I32, low_level_vm::ValueType::I32],
+                    &[],
+                ),
             };
             if !signature
                 .params_ordered()
