@@ -1,92 +1,140 @@
-//! Collection of running Wasm instances.
+//! Collection of Wasm instances and scheduling of their execution.
+//!
+//! The [`Executor`] holds a queue of instances that are ready to execute. Instances are added
+//! to it with [`InstanceBuilder::build`], and [`Executor::run`] pops an instance from the queue
+//! and runs it until it parks itself.
 
-use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
-use core::{alloc::Allocator, fmt, marker::PhantomData, sync::atomic::Ordering};
+use alloc::{string::String, sync::Arc, vec::Vec};
+use core::{alloc::Allocator, fmt};
 
 use crate::low_level_vm;
 
-/// List of running Wasm instances, indexed by a 32 bytes identifier.
-pub struct Executor<
-    TModule: AsRef<Module<TCodeAlloc, TCtxt>>,
-    TCodeAlloc: Allocator,
-    TCtxt,
-    TStackAlloc: Allocator,
-    TMemAlloc: Allocator,
-> {
-    /// Running instances.
-    instances: imbl::GenericHashMap<
-        [u8; 32],
-        InstanceRef<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>,
-        fnv::FnvBuildHasher,
-        imbl::shared_ptr::DefaultSharedPtr,
-    >,
-    /// Allocator of the native stacks of the instances.
-    stack_allocator: TStackAlloc,
-    /// Allocator of the linear memories of the instances.
-    memory_allocator: TMemAlloc,
+/// Queue of Wasm instances that are ready to execute.
+pub struct Executor<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator> {
+    /// Instances that are ready to unpark, alongside with what to do when unparking them.
+    ready: crossbeam_queue::SegQueue<ReadyInstance<TCodeAlloc, TStackAlloc, TMemAlloc>>,
     /// Proof that the trap handlers are installed, necessary in order to create instances.
     trap_handlers: low_level_vm::TrapHandlers,
+    /// Interfaces implemented natively by the host. See
+    /// [`ExecutorBuilder::register_native_interface`].
+    native_interfaces: hashbrown::HashSet<[u8; 32], fnv::FnvBuildHasher>,
 }
 
-/// Shared reference to a running instance.
-pub struct InstanceRef<
-    TModule: AsRef<Module<TCodeAlloc, TCtxt>>,
-    TCodeAlloc: Allocator,
-    TCtxt,
-    TStackAlloc: Allocator,
-    TMemAlloc: Allocator,
-> {
-    inner: Arc<InstanceRefInner<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>>,
+/// Prototype for an [`Executor`].
+pub struct ExecutorBuilder {
+    /// See [`Executor::trap_handlers`].
+    trap_handlers: low_level_vm::TrapHandlers,
+    /// See [`Executor::native_interfaces`].
+    native_interfaces: hashbrown::HashSet<[u8; 32], fnv::FnvBuildHasher>,
 }
 
-impl<
-        TModule: AsRef<Module<TCodeAlloc, TCtxt>>,
-        TCodeAlloc: Allocator,
-        TCtxt,
-        TStackAlloc: Allocator,
-        TMemAlloc: Allocator,
-    > Clone for InstanceRef<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>
-{
+impl ExecutorBuilder {
+    /// Initializes a new builder. Initially, no interface is implemented natively.
     #[inline]
-    fn clone(&self) -> Self {
-        InstanceRef {
-            inner: Arc::clone(&self.inner),
+    pub fn new(trap_handlers: low_level_vm::TrapHandlers) -> Self {
+        ExecutorBuilder {
+            trap_handlers,
+            native_interfaces: hashbrown::HashSet::with_hasher(fnv::FnvBuildHasher::default()),
+        }
+    }
+
+    /// Registers the given interface as being implemented natively by the host, for all the
+    /// instances of the executor. Has no effect if the interface is already registered.
+    #[inline]
+    pub fn register_native_interface(&mut self, interface: [u8; 32]) {
+        self.native_interfaces.insert(interface);
+    }
+
+    /// Builds the [`Executor`]. It initially doesn't contain any instance.
+    #[inline]
+    pub fn build<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>(
+        self,
+    ) -> Executor<TCodeAlloc, TStackAlloc, TMemAlloc> {
+        Executor {
+            ready: crossbeam_queue::SegQueue::new(),
+            trap_handlers: self.trap_handlers,
+            native_interfaces: self.native_interfaces,
         }
     }
 }
 
-impl<
-        TModule: AsRef<Module<TCodeAlloc, TCtxt>>,
-        TCodeAlloc: Allocator,
-        TCtxt,
-        TStackAlloc: Allocator,
-        TMemAlloc: Allocator,
-    > InstanceRef<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>
+/// Entry in [`Executor::ready`].
+struct ReadyInstance<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator> {
+    /// The instance ready to unpark.
+    instance: Instance<TCodeAlloc, TStackAlloc, TMemAlloc>,
+    /// How to unpark the instance.
+    status: ReadyStatus,
+}
+
+/// How to unpark an instance in [`Executor::ready`].
+enum ReadyStatus {
+    /// The instance has never been executed. Its `main` function must be called.
+    NotStarted,
+    /// The instance is suspended in a call to an imported function, and must be resumed with
+    /// this return value.
+    // TODO: never constructed yet, as message delivery isn't implemented
+    #[expect(dead_code)]
+    Resume(Option<low_level_vm::Value>),
+}
+
+/// Instantiated [`Module`].
+struct Instance<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator> {
+    /// The low-level instance.
+    vm: low_level_vm::Instance<
+        Arc<low_level_vm::Module<TCodeAlloc>>,
+        TCodeAlloc,
+        TStackAlloc,
+        TMemAlloc,
+    >,
+    /// Imported functions of the module, ordered by import index. See [`Module::imports`].
+    // TODO: not used yet, as message delivery isn't implemented
+    #[expect(dead_code)]
+    imports: Arc<[ModuleImport]>,
+    /// Public key of the instance.
+    // TODO: not used yet
+    #[expect(dead_code)]
+    public_key: [u8; 32],
+    /// Public key of the program handling each interface used by the module, indexed by
+    /// interface. Doesn't contain the interfaces implemented natively.
+    // TODO: not used yet, as message delivery isn't implemented
+    #[expect(dead_code)]
+    interface_handlers: hashbrown::HashMap<[u8; 32], [u8; 32], fnv::FnvBuildHasher>,
+}
+
+impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
+    Executor<TCodeAlloc, TStackAlloc, TMemAlloc>
 {
-    /// Calls the `main` function exported by the instance, and runs it until it returns.
+    /// Pops an instance from the queue of instances that are ready, and runs it until it parks
+    /// itself, returns from its `main` function, or fails. In the last two cases, the instance
+    /// is destroyed.
     ///
-    /// Returns the values returned by the `main` function, or an error if the instance doesn't
-    /// export a `main` function that takes no parameter, or if the execution traps.
-    ///
-    /// The instance is no longer ready after this function returns.
-    ///
-    /// # Panic
-    ///
-    /// Panics if the instance isn't ready, for example because it is already running.
-    /// Panics if the instance calls an imported function that isn't handled natively, as this
-    /// isn't supported yet.
-    // TODO: don't expose low_level_vm::Error
-    pub fn start(&self) -> Result<Vec<low_level_vm::Value>, low_level_vm::Error> {
-        let Some(mut instance) = self.inner.ready.take(Ordering::AcqRel) else {
-            panic!("instance isn't ready")
+    /// Does nothing if no instance is ready.
+    // TODO: pause if no instance is ready
+    pub fn run(&self) {
+        let Some(ReadyInstance {
+            mut instance,
+            status,
+        }) = self.ready.pop()
+        else {
+            return;
         };
 
-        let mut outcome = instance.vm.call("main", &[])?;
+        let mut outcome = match status {
+            ReadyStatus::NotStarted => instance.vm.call("main", &[]),
+            ReadyStatus::Resume(value) => instance.vm.resume(value),
+        };
+
         loop {
-            let (import, args) = match outcome {
-                low_level_vm::RunOutcome::Return(values) => return Ok(values),
-                low_level_vm::RunOutcome::ImportCall { import, args } => (import, args),
-                low_level_vm::RunOutcome::MemoryGrow { delta } => {
+            match outcome {
+                // TODO: report the error somehow
+                Err(_) => return,
+                Ok(low_level_vm::RunOutcome::Return(_)) => return,
+                Ok(low_level_vm::RunOutcome::ImportCall { .. }) => {
+                    // TODO: the instance is currently destroyed, as message delivery isn't
+                    // implemented
+                    return;
+                }
+                Ok(low_level_vm::RunOutcome::MemoryGrow { delta }) => {
                     let result = match instance.vm.grow_memory(delta) {
                         // The number of pages is at most 65536, and thus always fits in an `i32`.
                         Some(old_pages) => {
@@ -94,482 +142,314 @@ impl<
                         }
                         None => -1,
                     };
-                    outcome = instance.vm.resume(Some(low_level_vm::Value::I32(result)))?;
-                    continue;
+                    outcome = instance.vm.resume(Some(low_level_vm::Value::I32(result)));
                 }
-            };
-
-            // `import` is always a valid import index.
-            let native_handler = instance.vm.module().0.as_ref().native_handlers
-                [usize::try_from(import).unwrap_or_else(|_| unreachable!())];
-            let Some(native_handler) = native_handler else {
-                todo!("delivering messages to interface handlers")
-            };
-
-            match native_handler(&mut instance.ctxt, MessageAccess { args: &args }) {
-                Outcome::Resume(value) => outcome = instance.vm.resume(value)?,
-                Outcome::Park => todo!("delivering messages to interface handlers"),
             }
         }
     }
 }
 
-struct InstanceRefInner<
-    TModule: AsRef<Module<TCodeAlloc, TCtxt>>,
-    TCodeAlloc: Allocator,
-    TCtxt,
-    TStackAlloc: Allocator,
-    TMemAlloc: Allocator,
-> {
-    /// Private key of the instance.
-    private_key: [u8; 32],
-    /// Program handling each interface used by the module, or `None` if not set. Ordered the
-    /// same way as [`Module::interfaces`].
-    interface_handlers:
-        Vec<Option<InstanceRef<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>>>,
-    /// If `Some`, the instance is ready to resume execution.
-    ready: atomicbox::AtomicOptionBox<
-        RunningInstance<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>,
-    >,
-    /// List of other instances that ready to deliver a request or notification to
-    /// the instance, and that are thus parked.
-    waiting_to_deliver: crossbeam_queue::SegQueue<
-        Box<RunningInstance<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>>,
-    >,
-}
-
-/// Low-level instance alongside its context.
-struct RunningInstance<
-    TModule: AsRef<Module<TCodeAlloc, TCtxt>>,
-    TCodeAlloc: Allocator,
-    TCtxt,
-    TStackAlloc: Allocator,
-    TMemAlloc: Allocator,
-> {
-    /// The low-level instance.
-    vm: low_level_vm::Instance<InstanceModule<TModule, TCtxt>, TCodeAlloc, TStackAlloc, TMemAlloc>,
-    /// Context passed to the native interface handlers of the instance.
-    ctxt: TCtxt,
-}
-
-/// Wraps around a `TModule` implementing `AsRef<Module>`, and implements
-/// `AsRef<low_level_vm::Module>`, so that it can be passed to [`low_level_vm::Instance::new`].
-// FIXME: remove
-struct InstanceModule<TModule, TCtxt>(TModule, PhantomData<fn() -> TCtxt>);
-
-impl<TModule: AsRef<Module<TCodeAlloc, TCtxt>>, TCodeAlloc: Allocator, TCtxt>
-    AsRef<low_level_vm::Module<TCodeAlloc>> for InstanceModule<TModule, TCtxt>
-{
-    #[inline]
-    fn as_ref(&self) -> &low_level_vm::Module<TCodeAlloc> {
-        &self.0.as_ref().inner
-    }
-}
-
-/// Prototype for an [`Executor`].
-pub struct ExecutorBuilder<TStackAlloc: Allocator, TMemAlloc: Allocator> {
-    stack_allocator: TStackAlloc,
-    memory_allocator: TMemAlloc,
-    trap_handlers: low_level_vm::TrapHandlers,
-}
-
-impl<TStackAlloc: Allocator, TMemAlloc: Allocator> ExecutorBuilder<TStackAlloc, TMemAlloc> {
-    /// Initializes a new builder.
-    ///
-    /// The native stacks of the instances are allocated with `stack_allocator`, and their linear
-    /// memories with `memory_allocator`. See [`low_level_vm::Instance::new`] for the constraints
-    /// on these allocators.
-    #[inline]
-    pub fn new(
-        stack_allocator: TStackAlloc,
-        memory_allocator: TMemAlloc,
-        trap_handlers: low_level_vm::TrapHandlers,
-    ) -> Self {
-        ExecutorBuilder {
-            stack_allocator,
-            memory_allocator,
-            trap_handlers,
-        }
-    }
-
-    /// Builds the [`Executor`]. It initially doesn't contain any instance.
-    #[inline]
-    pub fn build<TModule: AsRef<Module<TCodeAlloc, TCtxt>>, TCodeAlloc: Allocator, TCtxt>(
-        self,
-    ) -> Executor<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc> {
-        Executor {
-            instances: imbl::GenericHashMap::with_hasher(fnv::FnvBuildHasher::default()),
-            stack_allocator: self.stack_allocator,
-            memory_allocator: self.memory_allocator,
-            trap_handlers: self.trap_handlers,
-        }
-    }
-}
-
 /// Prototype for a [`Module`].
-///
-/// The handlers of the interfaces set with [`ModuleBuilder::set_interface_as_native`] receive a
-/// mutable reference to a `TCtxt`.
-pub struct ModuleBuilder<'a, TCtxt> {
-    /// Wasm bytecode of the module. Not validated yet.
-    wasm: &'a [u8],
-    /// Imported functions of the module, ordered by import index.
-    imports: Vec<ModuleImport>,
-    /// Native handler of each imported function, or `None` if not set. Ordered the same way as
-    /// `imports`.
-    native_handlers: Vec<Option<fn(&mut TCtxt, MessageAccess<'_>) -> Outcome>>,
+pub struct ModuleBuilder<'a, TCodeAlloc: Allocator> {
+    /// The low-level builder.
+    inner: low_level_vm::Builder<'a, TCodeAlloc>,
 }
 
-/// Access to a message that the Wasm code sends on an interface handled natively. See
-/// [`ModuleBuilder::set_interface_as_native`].
-#[derive(Clone, Copy)]
-pub struct MessageAccess<'a> {
-    /// Parameters passed by the Wasm code to the imported function.
-    args: &'a [low_level_vm::Value],
-}
-
-impl MessageAccess<'_> {
-    /// Returns the parameter with the given index that the Wasm code has passed to the
-    /// imported function, or `None` if `index` is out of range.
+impl<'a, TCodeAlloc: Allocator> ModuleBuilder<'a, TCodeAlloc> {
+    /// Initializes a new builder for the given Wasm module.
+    ///
+    /// The compiled code will be written to memory allocated with `code_allocator`. This memory
+    /// must be executable.
     #[inline]
-    pub fn raw_param(&self, index: usize) -> Option<low_level_vm::Value> {
-        self.args.get(index).copied()
+    pub fn new(wasm: &'a [u8], code_allocator: TCodeAlloc) -> Self {
+        ModuleBuilder {
+            inner: low_level_vm::Builder::new(wasm, code_allocator),
+        }
+    }
+
+    /// Parses, validates and compiles the Wasm module.
+    ///
+    /// Each imported function of the module must be in a Wasm module named `interface-<hex>`,
+    /// where `<hex>` is the lowercase hexadecimal representation of the 32 bytes identifier of
+    /// the interface, and must be named either `request` or `notification`.
+    pub fn build(self) -> Result<Module<TCodeAlloc>, ModuleBuilderError> {
+        let inner = self.inner.build().map_err(ModuleBuilderError::Vm)?;
+
+        let mut imports = Vec::with_capacity(inner.imports_by_index().len());
+        for (module_name, name) in inner.imports_by_index() {
+            let interface = module_name
+                .strip_prefix("interface-")
+                .filter(|hex| hex.len() == 64)
+                .and_then(|hex| {
+                    let mut interface = [0u8; 32];
+                    for (byte, digits) in interface.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+                        for digit in digits {
+                            let nibble = match digit {
+                                b'0'..=b'9' => digit - b'0',
+                                b'a'..=b'f' => digit - b'a' + 10,
+                                _ => return None,
+                            };
+                            *byte = (*byte << 4) | nibble;
+                        }
+                    }
+                    Some(interface)
+                });
+
+            imports.push(match (interface, name) {
+                (Some(interface), "request") => ModuleImport::Request { interface },
+                (Some(interface), "notification") => ModuleImport::Notification { interface },
+                _ => {
+                    return Err(ModuleBuilderError::InvalidImport {
+                        module: String::from(module_name),
+                        name: String::from(name),
+                    });
+                }
+            });
+        }
+
+        Ok(Module {
+            inner: Arc::new(inner),
+            imports: Arc::from(imports),
+        })
     }
 }
 
-impl fmt::Debug for MessageAccess<'_> {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(self.args, f)
-    }
-}
-
-/// Value returned by the handlers registered with [`ModuleBuilder::set_interface_as_native`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Outcome {
-    /// Continue the execution of the Wasm code immediately, with this value as return value of
-    /// the imported function. Must be `None` if the imported function has no result.
-    Resume(Option<low_level_vm::Value>),
-    /// Suspend the execution of the Wasm code, as if the interface wasn't handled natively.
-    Park,
-}
-
-/// Function imported by a [`Module`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ModuleImport {
-    /// Function named `request` in the module `interface_<hex>`, where `<hex>` is the given
-    /// interface.
-    Request {
-        /// Interface the request is sent on.
-        interface: [u8; 32],
-    },
-    /// Function named `notification` in the module `interface_<hex>`, where `<hex>` is the
-    /// given interface.
-    Notification {
-        /// Interface the notification is sent on.
-        interface: [u8; 32],
-    },
-}
-
-/// Error that can happen in [`ModuleBuilder::new`].
+/// Error that can happen in [`ModuleBuilder::build`].
 #[derive(Debug)]
 pub enum ModuleBuilderError {
-    /// The Wasm bytecode is malformed.
-    Parse(wasmparser::BinaryReaderError),
-    /// An imported function isn't in a module named `interface_<hex>`, where `<hex>` is the
-    /// lowercase hexadecimal representation of 32 bytes, or its name is neither `request` nor
-    /// `notification`.
-    InvalidImportName {
-        /// Module name of the offending imported function.
+    /// Failed to parse, validate or compile the module.
+    // TODO: don't expose low_level_vm::Error
+    Vm(low_level_vm::Error),
+    /// An imported function isn't in a Wasm module named `interface-<hex>`, where `<hex>` is
+    /// the lowercase hexadecimal representation of 32 bytes, or its name is neither `request`
+    /// nor `notification`.
+    InvalidImport {
+        /// Wasm module name of the offending imported function.
         module: String,
         /// Name of the offending imported function.
         name: String,
     },
 }
 
-impl From<wasmparser::BinaryReaderError> for ModuleBuilderError {
-    #[inline]
-    fn from(err: wasmparser::BinaryReaderError) -> Self {
-        ModuleBuilderError::Parse(err)
-    }
-}
-
 impl fmt::Display for ModuleBuilderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ModuleBuilderError::Parse(err) => write!(f, "invalid Wasm: {err}"),
-            ModuleBuilderError::InvalidImportName { module, name } => {
+            ModuleBuilderError::Vm(err) => fmt::Display::fmt(err, f),
+            ModuleBuilderError::InvalidImport { module, name } => {
                 write!(f, "invalid imported function: {module:?}.{name:?}")
             }
         }
     }
 }
 
-impl<'a, TCtxt> ModuleBuilder<'a, TCtxt> {
-    /// Parses the imports of the given Wasm module.
-    ///
-    /// Each imported function must be in a module named `interface_<hex>`, where `<hex>` is the
-    /// lowercase hexadecimal representation of the 32 bytes identifier of the interface, and
-    /// must be named either `request` or `notification`.
-    ///
-    /// The Wasm bytecode is only fully validated by [`ModuleBuilder::build`].
-    pub fn new(wasm: &'a [u8]) -> Result<Self, ModuleBuilderError> {
-        let mut imports = Vec::new();
+/// A compiled Wasm module whose imported functions are all interface requests or
+/// notifications. See [`ModuleBuilder`].
+///
+/// Cloning a `Module` is cheap, as the compiled code is shared between the clones.
+pub struct Module<TCodeAlloc: Allocator> {
+    /// The compiled module.
+    inner: Arc<low_level_vm::Module<TCodeAlloc>>,
+    /// Imported functions of the module, ordered by import index.
+    imports: Arc<[ModuleImport]>,
+}
 
-        for payload in wasmparser::Parser::new(0).parse_all(wasm) {
-            let wasmparser::Payload::ImportSection(reader) = payload? else {
-                continue;
-            };
-
-            for import in reader.into_imports() {
-                let import = import?;
-                if !matches!(import.ty, wasmparser::TypeRef::Func(_)) {
-                    // Non-function imports are rejected by `ModuleBuilder::build`.
-                    continue;
-                }
-
-                let is_request = match import.name {
-                    "request" => true,
-                    "notification" => false,
-                    _ => {
-                        return Err(ModuleBuilderError::InvalidImportName {
-                            module: String::from(import.module),
-                            name: String::from(import.name),
-                        });
-                    }
-                };
-
-                let Some(hex) = import
-                    .module
-                    .strip_prefix("interface_")
-                    .filter(|hex| hex.len() == 64)
-                else {
-                    return Err(ModuleBuilderError::InvalidImportName {
-                        module: String::from(import.module),
-                        name: String::from(import.name),
-                    });
-                };
-
-                let mut interface = [0u8; 32];
-                for (byte, digits) in interface.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
-                    for digit in digits {
-                        let nibble = match digit {
-                            b'0'..=b'9' => digit - b'0',
-                            b'a'..=b'f' => digit - b'a' + 10,
-                            _ => {
-                                return Err(ModuleBuilderError::InvalidImportName {
-                                    module: String::from(import.module),
-                                    name: String::from(import.name),
-                                });
-                            }
-                        };
-                        *byte = (*byte << 4) | nibble;
-                    }
-                }
-
-                imports.push(if is_request {
-                    ModuleImport::Request { interface }
-                } else {
-                    ModuleImport::Notification { interface }
-                });
-            }
+impl<TCodeAlloc: Allocator> Clone for Module<TCodeAlloc> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Module {
+            inner: Arc::clone(&self.inner),
+            imports: Arc::clone(&self.imports),
         }
-
-        let native_handlers = alloc::vec![None; imports.len()];
-        Ok(ModuleBuilder {
-            wasm,
-            imports,
-            native_handlers,
-        })
-    }
-
-    /// Makes the `request` and `notification` imported functions of the given interface call
-    /// `handler` on the host, instead of delivering the message to the handler program of the
-    /// interface. Overwrites any previously-set handler for this interface.
-    ///
-    /// Has no effect if the module doesn't use this interface.
-    pub fn set_interface_as_native(
-        &mut self,
-        interface: [u8; 32],
-        handler: fn(&mut TCtxt, MessageAccess<'_>) -> Outcome,
-    ) {
-        for (import, native_handler) in self.imports.iter().zip(&mut self.native_handlers) {
-            match import {
-                ModuleImport::Request { interface: i }
-                | ModuleImport::Notification { interface: i }
-                    if *i == interface =>
-                {
-                    *native_handler = Some(handler);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// Validates and compiles the Wasm module.
-    ///
-    /// The compiled code is written to memory allocated with `code_allocator`, which must be
-    /// executable.
-    pub fn build<TCodeAlloc: Allocator>(
-        self,
-        code_allocator: TCodeAlloc,
-    ) -> Result<Module<TCodeAlloc, TCtxt>, low_level_vm::Error> {
-        let builder = low_level_vm::Builder::new(self.wasm, code_allocator);
-
-        let mut interfaces =
-            self.imports
-                .iter()
-                .map(|import| match import {
-                    ModuleImport::Request { interface }
-                    | ModuleImport::Notification { interface } => *interface,
-                })
-                .collect::<Vec<_>>();
-        interfaces.sort_unstable();
-        interfaces.dedup(); // TODO: no, error
-
-        Ok(Module {
-            inner: builder.build()?,
-            imports: self.imports,
-            native_handlers: self.native_handlers,
-            interfaces,
-        })
     }
 }
 
-/// A compiled Wasm module whose imported functions are all interface requests or
-/// notifications. See [`ModuleBuilder`].
-pub struct Module<TCodeAlloc: Allocator, TCtxt> {
-    /// The compiled module.
-    inner: low_level_vm::Module<TCodeAlloc>,
-    /// Imported functions of the module, ordered by import index.
-    // TODO: remove?
-    imports: Vec<ModuleImport>,
-    /// Native handler of each imported function, or `None` if the messages sent through this
-    /// import must be delivered to the handler program of its interface. Ordered the same way
-    /// as `imports`.
-    native_handlers: Vec<Option<fn(&mut TCtxt, MessageAccess<'_>) -> Outcome>>,
-    /// Interfaces used by the imported functions, sorted and without duplicates.
-    interfaces: Vec<[u8; 32]>,
+/// Function imported by a [`Module`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ModuleImport {
+    /// Function named `request` in the Wasm module `interface-<hex>`, where `<hex>` is the
+    /// given interface.
+    Request {
+        /// Interface the request is sent on.
+        interface: [u8; 32],
+    },
+    /// Function named `notification` in the Wasm module `interface-<hex>`, where `<hex>` is
+    /// the given interface.
+    Notification {
+        /// Interface the notification is sent on.
+        interface: [u8; 32],
+    },
 }
 
 /// Prototype for an instance of a [`Module`].
-pub struct InstanceBuilder<
-    'a,
-    TModule: AsRef<Module<TCodeAlloc, TCtxt>>,
-    TCodeAlloc: Allocator,
-    TCtxt,
-    TStackAlloc: Allocator,
-    TMemAlloc: Allocator,
-> {
+pub struct InstanceBuilder<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator> {
     /// Module to instantiate.
-    module: TModule,
-    /// Private key of the instance.
-    private_key: [u8; 32],
-    /// Program handling each interface used by the module, or `None` if not set yet. Ordered
-    /// the same way as [`Module::interfaces`].
-    interface_handlers:
-        Vec<Option<InstanceRef<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>>>,
-    /// Context passed to the native interface handlers of the instance.
-    ctxt: TCtxt,
+    module: Module<TCodeAlloc>,
+    /// Public key of the instance.
+    public_key: [u8; 32],
+    /// List of `(interface, handler public key)` registered with
+    /// [`InstanceBuilder::register_interface_handler`], in order of registration. Might contain
+    /// duplicate interfaces, which are reported by [`InstanceBuilder::build`].
+    interface_handlers: Vec<([u8; 32], [u8; 32])>,
     /// Allocator of the native stack of the instance.
     stack_allocator: TStackAlloc,
     /// Allocator of the linear memory of the instance.
     memory_allocator: TMemAlloc,
-    /// Proof that the trap handlers are installed, necessary in order to create the instance.
-    trap_handlers: &'a low_level_vm::TrapHandlers,
-    /// Marker for the `TCodeAlloc` generic parameter.
-    marker: PhantomData<fn() -> TCodeAlloc>,
 }
 
-impl<
-        'a,
-        TModule: AsRef<Module<TCodeAlloc, TCtxt>>,
-        TCodeAlloc: Allocator,
-        TCtxt,
-        TStackAlloc: Allocator,
-        TMemAlloc: Allocator,
-    > InstanceBuilder<'a, TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>
+impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
+    InstanceBuilder<TCodeAlloc, TStackAlloc, TMemAlloc>
 {
-    /// Initializes a new builder for an instance of the given module.
+    /// Initializes a new builder for an instance of the given module, whose public key is
+    /// `public_key`.
     ///
-    /// `private_key` is the private key of the instance. `ctxt` is passed to the handlers of the
-    /// interfaces set with [`ModuleBuilder::set_interface_as_native`]. The native stack of the
-    /// instance is allocated with `stack_allocator`, and its linear memory with
-    /// `memory_allocator`. See [`low_level_vm::Instance::new`] for the constraints on these
-    /// allocators.
+    /// The native stack of the instance is allocated with `stack_allocator`, and its linear
+    /// memory with `memory_allocator`. See [`low_level_vm::Instance::new`] for the constraints
+    /// on these allocators.
     ///
-    /// Initially, no interface has a handler program.
+    /// Initially, no interface has a handler.
+    #[inline]
     pub fn new(
-        module: TModule,
-        private_key: &[u8; 32],
-        ctxt: TCtxt,
+        module: &Module<TCodeAlloc>,
+        public_key: [u8; 32],
         stack_allocator: TStackAlloc,
         memory_allocator: TMemAlloc,
-        trap_handlers: &'a low_level_vm::TrapHandlers,
     ) -> Self {
-        let num_interfaces = AsRef::<Module<TCodeAlloc, TCtxt>>::as_ref(&module)
-            .interfaces
-            .len();
         InstanceBuilder {
-            module,
-            private_key: *private_key,
-            interface_handlers: (0..num_interfaces).map(|_| None).collect::<Vec<_>>(),
-            ctxt,
+            module: module.clone(),
+            public_key,
+            interface_handlers: Vec::new(),
             stack_allocator,
             memory_allocator,
-            trap_handlers,
-            marker: PhantomData,
         }
     }
 
-    /// Sets the program that handles the messages that the instance sends on the given
-    /// interface. Overwrites any previously-set handler.
+    /// Registers the program whose public key is `handler_public_key` as the handler of the
+    /// messages that the instance sends on `interface`.
     ///
-    /// # Panic
-    ///
-    /// Panics if `interface` isn't one of the interfaces used by the module, as returned by
-    /// [`Module::interfaces_sorted`].
-    pub fn set_interface_handler_program(
+    /// Each interface must be registered at most once, and must not be implemented natively
+    /// by the executor. This is checked by [`InstanceBuilder::build`]. Registering an interface
+    /// that the module doesn't use is allowed.
+    #[inline]
+    pub fn register_interface_handler(
         &mut self,
-        interface: &[u8; 32],
-        handler_program: &InstanceRef<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>,
+        interface: [u8; 32],
+        handler_public_key: [u8; 32],
     ) {
-        let Ok(index) = AsRef::<Module<TCodeAlloc, TCtxt>>::as_ref(&self.module)
-            .interfaces
-            .binary_search(interface)
-        else {
-            panic!("interface not used by the module")
-        };
-        self.interface_handlers[index] = Some(handler_program.clone());
+        self.interface_handlers
+            .push((interface, handler_public_key));
     }
 
-    /// Instantiates the module. The instance is initially ready to execute.
+    /// Instantiates the module and pushes the new instance to the queue of instances that are
+    /// ready in the given executor. The `main` function of the instance will be called by
+    /// [`Executor::run`].
     ///
-    /// Returns an error if allocating the native stack or the linear memory of the instance
-    /// fails, or if a data segment of the module doesn't fit in its linear memory.
-    // TODO: don't expose low_level_vm::Error
+    /// Returns an error if an interface has been registered multiple times with
+    /// [`InstanceBuilder::register_interface_handler`], or if it has been registered while
+    /// being implemented natively by the executor (see
+    /// [`ExecutorBuilder::register_native_interface`]), or if an interface used by the module
+    /// is neither implemented natively nor registered. Also returns an error if allocating the
+    /// linear memory of the instance fails, or if a data segment of the module doesn't fit in
+    /// its linear memory.
     pub fn build(
         self,
-    ) -> Result<InstanceRef<TModule, TCodeAlloc, TCtxt, TStackAlloc, TMemAlloc>, low_level_vm::Error>
-    {
+        executor: &Executor<TCodeAlloc, TStackAlloc, TMemAlloc>,
+    ) -> Result<(), InstanceBuilderError> {
+        let mut interface_handlers = hashbrown::HashMap::with_capacity_and_hasher(
+            self.interface_handlers.len(),
+            fnv::FnvBuildHasher::default(),
+        );
+        for (interface, handler_public_key) in self.interface_handlers {
+            if executor.native_interfaces.contains(&interface) {
+                return Err(InstanceBuilderError::NativeInterfaceHandler { interface });
+            }
+            if interface_handlers
+                .insert(interface, handler_public_key)
+                .is_some()
+            {
+                return Err(InstanceBuilderError::DuplicateInterfaceHandler { interface });
+            }
+        }
+
+        for import in self.module.imports.iter() {
+            let (ModuleImport::Request { interface } | ModuleImport::Notification { interface }) =
+                import;
+            if !executor.native_interfaces.contains(interface)
+                && !interface_handlers.contains_key(interface)
+            {
+                return Err(InstanceBuilderError::MissingInterfaceHandler {
+                    interface: *interface,
+                });
+            }
+        }
+
         let vm = low_level_vm::Instance::new(
-            InstanceModule(self.module, PhantomData),
-            self.trap_handlers,
+            self.module.inner,
+            &executor.trap_handlers,
             self.stack_allocator,
             self.memory_allocator,
-        )?;
-        let instance = RunningInstance {
-            vm,
-            ctxt: self.ctxt,
+        )
+        .map_err(InstanceBuilderError::Vm)?;
+
+        executor.ready.push(ReadyInstance {
+            instance: Instance {
+                vm,
+                imports: self.module.imports,
+                public_key: self.public_key,
+                interface_handlers,
+            },
+            status: ReadyStatus::NotStarted,
+        });
+
+        Ok(())
+    }
+}
+
+/// Error that can happen in [`InstanceBuilder::build`].
+#[derive(Debug)]
+pub enum InstanceBuilderError {
+    /// The interface has been registered multiple times with
+    /// [`InstanceBuilder::register_interface_handler`].
+    DuplicateInterfaceHandler {
+        /// The offending interface.
+        interface: [u8; 32],
+    },
+    /// The interface has been registered with [`InstanceBuilder::register_interface_handler`],
+    /// but is implemented natively by the executor.
+    NativeInterfaceHandler {
+        /// The offending interface.
+        interface: [u8; 32],
+    },
+    /// The module uses an interface that is neither implemented natively by the executor nor
+    /// registered with [`InstanceBuilder::register_interface_handler`].
+    MissingInterfaceHandler {
+        /// The offending interface.
+        interface: [u8; 32],
+    },
+    /// Failed to instantiate the module.
+    // TODO: don't expose low_level_vm::Error
+    Vm(low_level_vm::Error),
+}
+
+impl fmt::Display for InstanceBuilderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (message, interface) = match self {
+            InstanceBuilderError::DuplicateInterfaceHandler { interface } => {
+                ("interface handler registered multiple times", interface)
+            }
+            InstanceBuilderError::NativeInterfaceHandler { interface } => (
+                "interface handler registered for a native interface",
+                interface,
+            ),
+            InstanceBuilderError::MissingInterfaceHandler { interface } => {
+                ("no handler for interface", interface)
+            }
+            InstanceBuilderError::Vm(err) => return fmt::Display::fmt(err, f),
         };
 
-        Ok(InstanceRef {
-            inner: Arc::new(InstanceRefInner {
-                private_key: self.private_key,
-                interface_handlers: self.interface_handlers,
-                ready: atomicbox::AtomicOptionBox::new(Some(Box::new(instance))),
-                waiting_to_deliver: crossbeam_queue::SegQueue::new(),
-            }),
-        })
+        write!(f, "{message}: ")?;
+        for byte in interface {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
     }
 }

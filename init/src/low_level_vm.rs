@@ -59,16 +59,15 @@ use crate::alloc_stack_guard::{self, WithStackGuard};
 mod stack_switch;
 
 use cranelift_codegen::{
+    Context, FinalizedRelocTarget,
     binemit::Reloc,
     control::ControlPlane,
     ir::{
-        self, condcodes::IntCC, types, AbiParam, BlockArg, BlockCall, ExtFuncData, ExternalName,
-        InstBuilder, JumpTableData, MemFlagsData, Signature, TrapCode, UserExternalName,
-        UserFuncName,
+        self, AbiParam, BlockArg, BlockCall, ExtFuncData, ExternalName, InstBuilder, JumpTableData,
+        MemFlagsData, Signature, TrapCode, UserExternalName, UserFuncName, condcodes::IntCC, types,
     },
     isa::{CallConv, OwnedTargetIsa},
     settings::{self, Configurable as _},
-    Context, FinalizedRelocTarget,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use wasmparser::{BlockType, FuncType, Operator, Payload, ValType};
@@ -1123,11 +1122,11 @@ enum InstanceState {
 }
 
 impl<
-        TModule: AsRef<Module<TCodeAlloc>>,
-        TCodeAlloc: Allocator,
-        TStackAlloc: Allocator,
-        TMemAlloc: Allocator,
-    > Instance<TModule, TCodeAlloc, TStackAlloc, TMemAlloc>
+    TModule: AsRef<Module<TCodeAlloc>>,
+    TCodeAlloc: Allocator,
+    TStackAlloc: Allocator,
+    TMemAlloc: Allocator,
+> Instance<TModule, TCodeAlloc, TStackAlloc, TMemAlloc>
 {
     /// Instantiates the given module. Its native stack is allocated with `stack_allocator`, at
     /// each call to [`Instance::call`], and its linear memory with `memory_allocator`.
@@ -1235,17 +1234,15 @@ impl<
         self.write_values(&module.funcs[func_idx as usize].params, args)?;
         self.state = InstanceState::Idle;
 
-        let stack_allocator = match mem::replace(
-            &mut self.stack_ctx_state,
-            StackCtxState::AllocationFailed,
-        ) {
-            StackCtxState::Uninit(allocator) => allocator,
-            // SAFETY: `stack_ctx` contains a context, and isn't being resumed.
-            StackCtxState::Init => unsafe {
-                stack_switch::Context::deinit(self.stack_ctx.as_mut())
-            },
-            StackCtxState::AllocationFailed => return Err(Error::Allocation),
-        };
+        let stack_allocator =
+            match mem::replace(&mut self.stack_ctx_state, StackCtxState::AllocationFailed) {
+                StackCtxState::Uninit(allocator) => allocator,
+                // SAFETY: `stack_ctx` contains a context, and isn't being resumed.
+                StackCtxState::Init => unsafe {
+                    stack_switch::Context::deinit(self.stack_ctx.as_mut())
+                },
+                StackCtxState::AllocationFailed => return Err(Error::Allocation),
+            };
 
         // SAFETY: the stack context and the `VmCtx` are boxed and outlive the execution, and
         // the stack isn't used by anything else.
@@ -1465,11 +1462,11 @@ impl<
 }
 
 impl<
-        TModule: AsRef<Module<TCodeAlloc>>,
-        TCodeAlloc: Allocator,
-        TStackAlloc: Allocator,
-        TMemAlloc: Allocator,
-    > Drop for Instance<TModule, TCodeAlloc, TStackAlloc, TMemAlloc>
+    TModule: AsRef<Module<TCodeAlloc>>,
+    TCodeAlloc: Allocator,
+    TStackAlloc: Allocator,
+    TMemAlloc: Allocator,
+> Drop for Instance<TModule, TCodeAlloc, TStackAlloc, TMemAlloc>
 {
     fn drop(&mut self) {
         // The Wasm stack contains no Rust frames, so a suspended execution can simply be

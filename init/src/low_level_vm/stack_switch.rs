@@ -48,7 +48,7 @@ use core::{
     arch::global_asm,
     fmt,
     marker::PhantomPinned,
-    mem::{offset_of, MaybeUninit},
+    mem::{MaybeUninit, offset_of},
     pin::Pin,
     ptr::{self, NonNull},
 };

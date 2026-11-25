@@ -77,8 +77,8 @@ pub fn run(config: Config) -> ! {
                     syscalls::Sysno::mount,
                     boot_device.as_ptr(),
                     c"/boot".as_ptr(),
-                    c"vfat".as_ptr(),   // TODO: don't hardcode?
-                    1usize, // MS_RDONLY
+                    c"vfat".as_ptr(), // TODO: don't hardcode?
+                    1usize,           // MS_RDONLY
                     0usize
                 )
             } {
@@ -107,7 +107,10 @@ pub fn run(config: Config) -> ! {
         }
     };
 
-    // Execute each available program one after the other.
+    let executor = executor::ExecutorBuilder::new(trap_handlers).build();
+
+    // Instantiate each available program.
+    let mut num_instances = 0usize;
     for program in &available_programs {
         let mut path = String::from("/boot/");
         for byte in program {
@@ -123,15 +126,10 @@ pub fn run(config: Config) -> ! {
             }
         };
 
-        let module = match executor::ModuleBuilder::<()>::new(&wasm) {
-            Ok(builder) => builder.build(alloc_mmap::Mmap::read_write_exec()),
-            Err(err) => {
-                println!("Program {path}: {err}");
-                continue;
-            }
-        };
-        let module = match module {
-            Ok(module) => alloc::sync::Arc::new(module),
+        let module = match executor::ModuleBuilder::new(&wasm, alloc_mmap::Mmap::read_write_exec())
+            .build()
+        {
+            Ok(module) => module,
             Err(err) => {
                 println!("Program {path}: failed to compile: {err}");
                 continue;
@@ -153,28 +151,26 @@ pub fn run(config: Config) -> ! {
             println!("Program {path}: failed to generate private key: {err}");
             continue;
         }
+        let public_key =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(private_key));
 
         let instance = executor::InstanceBuilder::new(
-            module,
-            &private_key,
-            (),
+            &module,
+            public_key.to_bytes(),
             alloc_mmap::Mmap::read_write(),
             alloc_mmap::Mmap::read_write(),
-            &trap_handlers,
-        )
-        .build();
-        let instance = match instance {
-            Ok(instance) => instance,
-            Err(err) => {
-                println!("Program {path}: failed to instantiate: {err}");
-                continue;
-            }
-        };
-
-        match instance.start() {
-            Ok(values) => println!("Program {path}: returned {values:?}"),
-            Err(err) => println!("Program {path}: failed: {err}"),
+        );
+        match instance.build(&executor) {
+            Ok(()) => num_instances += 1,
+            Err(err) => println!("Program {path}: failed to instantiate: {err}"),
         }
+    }
+
+    // Run each instance once.
+    // TODO: instances are never pushed back to the queue at the moment, so calling `run` more
+    // often than that would do nothing
+    for _ in 0..num_instances {
+        executor.run();
     }
 
     // As PID 1, exiting would make the kernel panic. Pause forever instead.
