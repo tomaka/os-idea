@@ -6,7 +6,8 @@
 //!
 //! Supported subset:
 //!
-//! - Function imports only, each with at most one result. No start function.
+//! - Function imports only, each with at most four parameters and at most one result. No start
+//!   function.
 //! - Only `i32` and `i64` value types (no floats, no SIMD, no references).
 //! - Control flow (`block`, `loop`, `if`/`else`, `br`, `br_if`, `br_table`, `return`,
 //!   `unreachable`), direct and indirect calls, locals, globals, all integer arithmetic.
@@ -47,7 +48,7 @@ use core::{
     cell::Cell,
     fmt,
     marker::PhantomData,
-    mem::{self, MaybeUninit, offset_of},
+    mem::{self, offset_of, MaybeUninit},
     pin::Pin,
     ptr::{self, NonNull},
     slice,
@@ -58,16 +59,18 @@ use crate::alloc_stack_guard::{self, WithStackGuard};
 
 mod stack_switch;
 
+use arrayvec::ArrayVec;
 use cranelift_codegen::{
-    Context, FinalizedRelocTarget,
     binemit::Reloc,
     control::ControlPlane,
     ir::{
-        self, AbiParam, BlockArg, BlockCall, ExtFuncData, ExternalName, InstBuilder, JumpTableData,
-        MemFlagsData, Signature, TrapCode, UserExternalName, UserFuncName, condcodes::IntCC, types,
+        self, condcodes::IntCC, types, AbiParam, BlockArg, BlockCall, ExtFuncData, ExternalName,
+        InstBuilder, JumpTableData, MemFlagsData, Signature, TrapCode, UserExternalName,
+        UserFuncName,
     },
     isa::{CallConv, OwnedTargetIsa},
     settings::{self, Configurable as _},
+    Context, FinalizedRelocTarget,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use wasmparser::{BlockType, FuncType, Operator, Payload, ValType};
@@ -168,7 +171,10 @@ pub enum RunOutcome {
     /// The Wasm code has called the imported function whose index is `import` (see
     /// [`Module::imports_by_index`]) with the given arguments. Call [`Instance::resume`] with
     /// the return value in order to continue the execution.
-    ImportCall { import: u32, args: Vec<Value> },
+    ImportCall {
+        import: u32,
+        args: ArrayVec<Value, 4>,
+    },
     /// The Wasm code has executed `memory.grow` in order to add `delta` pages to its linear
     /// memory. The memory hasn't been grown yet. Call [`Instance::grow_memory`] in order to grow
     /// it (or don't, in order to deny the request), then call [`Instance::resume`] with the
@@ -451,6 +457,11 @@ impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
                         };
                         // The type section always precedes the import section.
                         let sig = &types[ty as usize];
+                        if sig.params.len() > 4 {
+                            return Err(Error::Unsupported(
+                                "import with more than four parameters",
+                            ));
+                        }
                         if sig.results.len() > 1 {
                             return Err(Error::Unsupported("import with more than one result"));
                         }
@@ -1122,11 +1133,11 @@ enum InstanceState {
 }
 
 impl<
-    TModule: AsRef<Module<TCodeAlloc>>,
-    TCodeAlloc: Allocator,
-    TStackAlloc: Allocator,
-    TMemAlloc: Allocator,
-> Instance<TModule, TCodeAlloc, TStackAlloc, TMemAlloc>
+        TModule: AsRef<Module<TCodeAlloc>>,
+        TCodeAlloc: Allocator,
+        TStackAlloc: Allocator,
+        TMemAlloc: Allocator,
+    > Instance<TModule, TCodeAlloc, TStackAlloc, TMemAlloc>
 {
     /// Instantiates the given module. Its native stack is allocated with `stack_allocator`, at
     /// each call to [`Instance::call`], and its linear memory with `memory_allocator`.
@@ -1384,6 +1395,7 @@ impl<
                 };
                 Ok(RunOutcome::ImportCall {
                     import,
+                    // `Builder::build` checks that all imports have at most four parameters.
                     args: self.read_values(&module.funcs[import as usize].params),
                 })
             }
@@ -1444,7 +1456,12 @@ impl<
     }
 
     /// Reads values of the given types from the buffer shared with the Wasm code.
-    fn read_values(&self, tys: &[ir::Type]) -> Vec<Value> {
+    ///
+    /// # Panic
+    ///
+    /// Panics if `T` can't hold as many values as there are types, such as an [`ArrayVec`]
+    /// that is too small.
+    fn read_values<T: FromIterator<Value>>(&self, tys: &[ir::Type]) -> T {
         tys.iter()
             .enumerate()
             .map(|(i, ty)| {
@@ -1457,16 +1474,16 @@ impl<
                     Value::I64(raw as i64)
                 }
             })
-            .collect::<Vec<_>>()
+            .collect::<T>()
     }
 }
 
 impl<
-    TModule: AsRef<Module<TCodeAlloc>>,
-    TCodeAlloc: Allocator,
-    TStackAlloc: Allocator,
-    TMemAlloc: Allocator,
-> Drop for Instance<TModule, TCodeAlloc, TStackAlloc, TMemAlloc>
+        TModule: AsRef<Module<TCodeAlloc>>,
+        TCodeAlloc: Allocator,
+        TStackAlloc: Allocator,
+        TMemAlloc: Allocator,
+    > Drop for Instance<TModule, TCodeAlloc, TStackAlloc, TMemAlloc>
 {
     fn drop(&mut self) {
         // The Wasm stack contains no Rust frames, so a suspended execution can simply be

@@ -368,6 +368,7 @@ name = "init"
 version = "0.1.0"
 dependencies = [
  "allocator-api2 0.4.0",
+ "arrayvec",
  "atomicbox",
  "cranelift-codegen",
  "cranelift-frontend",
