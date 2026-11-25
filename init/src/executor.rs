@@ -71,6 +71,10 @@ enum ReadyStatus {
     /// The instance has never been executed. Its `main` function must be called.
     NotStarted,
     /// The instance is suspended in a call to an imported function of type
+    /// [`ModuleImport::Request`] or [`ModuleImport::Notification`], and the message has been
+    /// delivered. The call must return.
+    MessageDelivered,
+    /// The instance is suspended in a call to an imported function of type
     /// [`ModuleImport::Request`], and the request must be sent.
     SendingRequest {
         /// Interface the request is sent on.
@@ -112,16 +116,30 @@ enum ReadyStatus {
     WaitingForMessage {
         /// Offset in the linear memory of the instance of the buffer where to write the
         /// message.
-        // TODO: not used yet, as message delivery isn't implemented
-        #[expect(dead_code)]
         buffer_ptr: u32,
         /// Size in bytes of the buffer where to write the message. The range
         /// `buffer_ptr..buffer_ptr + buffer_len` is always within the bounds of the linear
         /// memory, as the linear memory can only grow.
-        // TODO: not used yet, as message delivery isn't implemented
-        #[expect(dead_code)]
         buffer_len: u32,
     },
+}
+
+/// Entry in [`Instance::pending_delivery`].
+struct PendingDelivery<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator> {
+    /// Instance that has sent the message. Suspended in a call to an imported function of type
+    /// [`ModuleImport::Request`] or [`ModuleImport::Notification`].
+    instance: Instance<TCodeAlloc, TStackAlloc, TMemAlloc>,
+    /// Offset in the linear memory of [`PendingDelivery::instance`] of the buffer containing
+    /// the message.
+    // TODO: not used yet, as message delivery isn't implemented
+    #[expect(dead_code)]
+    buffer_ptr: u32,
+    /// Size in bytes of the buffer containing the message. The range
+    /// `buffer_ptr..buffer_ptr + buffer_len` is always within the bounds of the linear memory
+    /// of [`PendingDelivery::instance`], as the linear memory can only grow.
+    // TODO: not used yet, as message delivery isn't implemented
+    #[expect(dead_code)]
+    buffer_len: u32,
 }
 
 /// Instantiated [`Module`].
@@ -144,6 +162,9 @@ struct Instance<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Alloca
     // TODO: not used yet, as message delivery isn't implemented
     #[expect(dead_code)]
     interface_handlers: hashbrown::HashMap<[u8; 32], [u8; 32], fnv::FnvBuildHasher>,
+    /// Messages waiting to be delivered to this instance.
+    pending_delivery:
+        Arc<crossbeam_queue::SegQueue<PendingDelivery<TCodeAlloc, TStackAlloc, TMemAlloc>>>,
 }
 
 impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
@@ -166,10 +187,31 @@ impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
 
         let mut outcome = match status {
             ReadyStatus::NotStarted => instance.vm.call("main", &[]),
+            ReadyStatus::MessageDelivered => instance.vm.resume(None),
+            ReadyStatus::WaitingForMessage {
+                buffer_ptr,
+                buffer_len,
+            } => {
+                if let Some(delivery) = instance.pending_delivery.pop() {
+                    // TODO: deliver the message to `instance`
+                    self.ready.push(ReadyInstance {
+                        instance: delivery.instance,
+                        status: ReadyStatus::MessageDelivered,
+                    });
+                }
+                self.ready.push(ReadyInstance {
+                    instance,
+                    status: ReadyStatus::WaitingForMessage {
+                        buffer_ptr,
+                        buffer_len,
+                    },
+                });
+                return;
+            }
             // TODO: message delivery isn't implemented, the instance is currently destroyed
-            ReadyStatus::SendingRequest { .. }
-            | ReadyStatus::SendingNotification { .. }
-            | ReadyStatus::WaitingForMessage { .. } => return,
+            ReadyStatus::SendingRequest { .. } | ReadyStatus::SendingNotification { .. } => {
+                return;
+            }
         };
 
         loop {
@@ -536,6 +578,7 @@ impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
                 imports: self.module.imports,
                 public_key: self.public_key,
                 interface_handlers,
+                pending_delivery: Arc::new(crossbeam_queue::SegQueue::new()),
             },
             status: ReadyStatus::NotStarted,
         });
