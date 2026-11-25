@@ -76,9 +76,8 @@ enum ReadyStatus {
     /// The instance is suspended in a call to an imported function of type
     /// [`ModuleImport::Notification`], and the notification must be sent.
     SendingNotification,
-    /// The instance is waiting for a message to be delivered to it.
-    // TODO: never constructed yet, as message delivery isn't implemented
-    #[expect(dead_code)]
+    /// The instance is suspended in a call to an imported function of type
+    /// [`ModuleImport::WaitForMessage`], and is waiting for a message to be delivered to it.
     WaitingForMessage,
 }
 
@@ -145,6 +144,7 @@ impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
                     let status = match import {
                         ModuleImport::Request { .. } => ReadyStatus::SendingRequest,
                         ModuleImport::Notification { .. } => ReadyStatus::SendingNotification,
+                        ModuleImport::WaitForMessage => ReadyStatus::WaitingForMessage,
                     };
                     self.ready.push(ReadyInstance { instance, status });
                     return;
@@ -186,7 +186,8 @@ impl<'a, TCodeAlloc: Allocator> ModuleBuilder<'a, TCodeAlloc> {
     ///
     /// Each imported function of the module must be in a Wasm module named `interface-<hex>`,
     /// where `<hex>` is the lowercase hexadecimal representation of the 32 bytes identifier of
-    /// the interface, and must be named either `request` or `notification`.
+    /// the interface, and must be named either `request` or `notification`, or must be in a Wasm
+    /// module named `interface` and be named `wait_for_message`.
     pub fn build(self) -> Result<Module<TCodeAlloc>, ModuleBuilderError> {
         let inner = self.inner.build().map_err(ModuleBuilderError::Vm)?;
 
@@ -210,9 +211,10 @@ impl<'a, TCodeAlloc: Allocator> ModuleBuilder<'a, TCodeAlloc> {
                     Some(interface)
                 });
 
-            imports.push(match (interface, name) {
-                (Some(interface), "request") => ModuleImport::Request { interface },
-                (Some(interface), "notification") => ModuleImport::Notification { interface },
+            imports.push(match (module_name, interface, name) {
+                ("interface", _, "wait_for_message") => ModuleImport::WaitForMessage,
+                (_, Some(interface), "request") => ModuleImport::Request { interface },
+                (_, Some(interface), "notification") => ModuleImport::Notification { interface },
                 _ => {
                     return Err(ModuleBuilderError::InvalidImport {
                         module: String::from(module_name),
@@ -237,7 +239,8 @@ pub enum ModuleBuilderError {
     Vm(low_level_vm::Error),
     /// An imported function isn't in a Wasm module named `interface-<hex>`, where `<hex>` is
     /// the lowercase hexadecimal representation of 32 bytes, or its name is neither `request`
-    /// nor `notification`.
+    /// nor `notification`. Imported functions named `wait_for_message` in the Wasm module named
+    /// `interface` are an exception and are allowed.
     InvalidImport {
         /// Wasm module name of the offending imported function.
         module: String,
@@ -258,7 +261,7 @@ impl fmt::Display for ModuleBuilderError {
 }
 
 /// A compiled Wasm module whose imported functions are all interface requests or
-/// notifications. See [`ModuleBuilder`].
+/// notifications, or waiting for a message. See [`ModuleBuilder`].
 ///
 /// Cloning a `Module` is cheap, as the compiled code is shared between the clones.
 pub struct Module<TCodeAlloc: Allocator> {
@@ -293,6 +296,8 @@ pub enum ModuleImport {
         /// Interface the notification is sent on.
         interface: [u8; 32],
     },
+    /// Function named `wait_for_message` in the Wasm module `interface`.
+    WaitForMessage,
 }
 
 /// Prototype for an instance of a [`Module`].
@@ -387,7 +392,10 @@ impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
 
         for import in self.module.imports.iter() {
             let (ModuleImport::Request { interface } | ModuleImport::Notification { interface }) =
-                import;
+                import
+            else {
+                continue;
+            };
             if !executor.native_interfaces.contains(interface)
                 && !interface_handlers.contains_key(interface)
             {
