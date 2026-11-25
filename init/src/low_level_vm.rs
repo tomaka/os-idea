@@ -115,6 +115,13 @@ pub enum Value {
     I64(i64),
 }
 
+/// Type of a Wasm value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ValueType {
+    I32,
+    I64,
+}
+
 /// Error that can happen when compiling or running a module.
 #[derive(Debug)]
 pub enum Error {
@@ -800,10 +807,44 @@ impl<'a, TCodeAlloc: Allocator> Builder<'a, TCodeAlloc> {
 }
 
 impl<TCodeAlloc: Allocator> Module<TCodeAlloc> {
-    /// Returns the list of imported functions, as `(module name, field name)`, ordered by
-    /// import index.
-    pub fn imports_by_index(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {
-        self.imports.iter().map(|(m, n)| (&m[..], &n[..]))
+    /// Returns the list of imported functions, as `(module name, field name, signature)`,
+    /// ordered by import index.
+    pub fn imports_by_index(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&str, &str, FunctionSignature<'_>)> {
+        // Imported functions are the first entries of `funcs`.
+        self.imports
+            .iter()
+            .zip(&self.funcs)
+            .map(|((m, n), sig)| (&m[..], &n[..], FunctionSignature { inner: sig }))
+    }
+}
+
+/// Signature of a function of a [`Module`].
+#[derive(Debug, Clone, Copy)]
+pub struct FunctionSignature<'a> {
+    inner: &'a FuncSig,
+}
+
+impl<'a> FunctionSignature<'a> {
+    /// Returns the types of the parameters of the function, in order.
+    pub fn params_ordered(&self) -> impl ExactSizeIterator<Item = ValueType> + 'a {
+        self.inner.params.iter().map(|ty| clif_to_value_type(*ty))
+    }
+
+    /// Returns the types of the results of the function, in order.
+    pub fn results_ordered(&self) -> impl ExactSizeIterator<Item = ValueType> + 'a {
+        self.inner.results.iter().map(|ty| clif_to_value_type(*ty))
+    }
+}
+
+/// Converts a type of a [`FuncSig`] to a [`ValueType`].
+fn clif_to_value_type(ty: ir::Type) -> ValueType {
+    match ty {
+        types::I32 => ValueType::I32,
+        types::I64 => ValueType::I64,
+        // `FuncSig`s are built with `val_type`, which only produces these two types.
+        _ => unreachable!(),
     }
 }
 
@@ -1230,6 +1271,19 @@ impl<
     #[inline]
     pub fn module(&self) -> &TModule {
         &self.module
+    }
+
+    /// Returns the content of the linear memory. Its size is always a multiple of 65536.
+    pub fn memory(&self) -> &[u8] {
+        // SAFETY: the Wasm code isn't running and the memory can't be grown or freed while the
+        // returned slice is alive, as `self` is borrowed. `mem_base` points to `mem_len`
+        // initialized bytes.
+        unsafe {
+            let vmctx = &*self.vmctx;
+            // The memory has been successfully allocated with this size.
+            let len = usize::try_from(vmctx.mem_len).unwrap_or_else(|_| unreachable!());
+            slice::from_raw_parts(vmctx.mem_base.as_ptr(), len)
+        }
     }
 
     /// Starts executing the exported function with the given name.

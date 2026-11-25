@@ -78,7 +78,19 @@ enum ReadyStatus {
     SendingNotification,
     /// The instance is suspended in a call to an imported function of type
     /// [`ModuleImport::WaitForMessage`], and is waiting for a message to be delivered to it.
-    WaitingForMessage,
+    WaitingForMessage {
+        /// Offset in the linear memory of the instance of the buffer where to write the
+        /// message.
+        // TODO: not used yet, as message delivery isn't implemented
+        #[expect(dead_code)]
+        buffer_ptr: u32,
+        /// Size in bytes of the buffer where to write the message. The range
+        /// `buffer_ptr..buffer_ptr + buffer_len` is always within the bounds of the linear
+        /// memory, as the linear memory can only grow.
+        // TODO: not used yet, as message delivery isn't implemented
+        #[expect(dead_code)]
+        buffer_len: u32,
+    },
 }
 
 /// Instantiated [`Module`].
@@ -126,7 +138,7 @@ impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
             // TODO: message delivery isn't implemented, the instance is currently destroyed
             ReadyStatus::SendingRequest
             | ReadyStatus::SendingNotification
-            | ReadyStatus::WaitingForMessage => return,
+            | ReadyStatus::WaitingForMessage { .. } => return,
         };
 
         loop {
@@ -134,7 +146,7 @@ impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
                 // TODO: report the error somehow
                 Err(_) => return,
                 Ok(low_level_vm::RunOutcome::Return(_)) => return,
-                Ok(low_level_vm::RunOutcome::ImportCall { import, .. }) => {
+                Ok(low_level_vm::RunOutcome::ImportCall { import, args }) => {
                     // The low-level VM only reports imports that exist in the module, and
                     // `instance.imports` contains all the imports of the module.
                     let import = usize::try_from(import)
@@ -144,7 +156,32 @@ impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
                     let status = match import {
                         ModuleImport::Request { .. } => ReadyStatus::SendingRequest,
                         ModuleImport::Notification { .. } => ReadyStatus::SendingNotification,
-                        ModuleImport::WaitForMessage => ReadyStatus::WaitingForMessage,
+                        ModuleImport::WaitForMessage => {
+                            // The signature of the import has been checked when building the
+                            // module.
+                            let [
+                                low_level_vm::Value::I32(buffer_ptr),
+                                low_level_vm::Value::I32(buffer_len),
+                            ] = args[..]
+                            else {
+                                unreachable!()
+                            };
+                            let buffer_ptr = buffer_ptr.cast_unsigned();
+                            let buffer_len = buffer_len.cast_unsigned();
+                            // TODO: report the error somehow
+                            if usize::try_from(buffer_ptr)
+                                .ok()
+                                .zip(usize::try_from(buffer_len).ok())
+                                .and_then(|(ptr, len)| instance.vm.memory().get(ptr..)?.get(..len))
+                                .is_none()
+                            {
+                                return;
+                            }
+                            ReadyStatus::WaitingForMessage {
+                                buffer_ptr,
+                                buffer_len,
+                            }
+                        }
                     };
                     self.ready.push(ReadyInstance { instance, status });
                     return;
@@ -188,11 +225,13 @@ impl<'a, TCodeAlloc: Allocator> ModuleBuilder<'a, TCodeAlloc> {
     /// where `<hex>` is the lowercase hexadecimal representation of the 32 bytes identifier of
     /// the interface, and must be named either `request` or `notification`, or must be in a Wasm
     /// module named `interface` and be named `wait_for_message`.
+    ///
+    /// The `wait_for_message` function must have the signature `(i32, i32) -> i32`.
     pub fn build(self) -> Result<Module<TCodeAlloc>, ModuleBuilderError> {
         let inner = self.inner.build().map_err(ModuleBuilderError::Vm)?;
 
         let mut imports = Vec::with_capacity(inner.imports_by_index().len());
-        for (module_name, name) in inner.imports_by_index() {
+        for (module_name, name, signature) in inner.imports_by_index() {
             let interface = module_name
                 .strip_prefix("interface-")
                 .filter(|hex| hex.len() == 64)
@@ -211,7 +250,7 @@ impl<'a, TCodeAlloc: Allocator> ModuleBuilder<'a, TCodeAlloc> {
                     Some(interface)
                 });
 
-            imports.push(match (module_name, interface, name) {
+            let import = match (module_name, interface, name) {
                 ("interface", _, "wait_for_message") => ModuleImport::WaitForMessage,
                 (_, Some(interface), "request") => ModuleImport::Request { interface },
                 (_, Some(interface), "notification") => ModuleImport::Notification { interface },
@@ -221,7 +260,33 @@ impl<'a, TCodeAlloc: Allocator> ModuleBuilder<'a, TCodeAlloc> {
                         name: String::from(name),
                     });
                 }
-            });
+            };
+
+            let (expected_params, expected_results): (&[_], &[_]) = match import {
+                ModuleImport::WaitForMessage => (
+                    &[low_level_vm::ValueType::I32, low_level_vm::ValueType::I32],
+                    &[low_level_vm::ValueType::I32],
+                ),
+                // TODO: the signature of these functions isn't decided yet
+                ModuleImport::Request { .. } | ModuleImport::Notification { .. } => {
+                    imports.push(import);
+                    continue;
+                }
+            };
+            if !signature
+                .params_ordered()
+                .eq(expected_params.iter().copied())
+                || !signature
+                    .results_ordered()
+                    .eq(expected_results.iter().copied())
+            {
+                return Err(ModuleBuilderError::InvalidImportSignature {
+                    module: String::from(module_name),
+                    name: String::from(name),
+                });
+            }
+
+            imports.push(import);
         }
 
         Ok(Module {
@@ -247,6 +312,13 @@ pub enum ModuleBuilderError {
         /// Name of the offending imported function.
         name: String,
     },
+    /// An imported function doesn't have the signature expected for its name.
+    InvalidImportSignature {
+        /// Wasm module name of the offending imported function.
+        module: String,
+        /// Name of the offending imported function.
+        name: String,
+    },
 }
 
 impl fmt::Display for ModuleBuilderError {
@@ -255,6 +327,12 @@ impl fmt::Display for ModuleBuilderError {
             ModuleBuilderError::Vm(err) => fmt::Display::fmt(err, f),
             ModuleBuilderError::InvalidImport { module, name } => {
                 write!(f, "invalid imported function: {module:?}.{name:?}")
+            }
+            ModuleBuilderError::InvalidImportSignature { module, name } => {
+                write!(
+                    f,
+                    "invalid signature of imported function: {module:?}.{name:?}"
+                )
             }
         }
     }
