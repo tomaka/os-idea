@@ -70,11 +70,16 @@ struct ReadyInstance<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: A
 enum ReadyStatus {
     /// The instance has never been executed. Its `main` function must be called.
     NotStarted,
-    /// The instance is suspended in a call to an imported function, and must be resumed with
-    /// this return value.
+    /// The instance is suspended in a call to an imported function of type
+    /// [`ModuleImport::Request`], and the request must be sent.
+    SendingRequest,
+    /// The instance is suspended in a call to an imported function of type
+    /// [`ModuleImport::Notification`], and the notification must be sent.
+    SendingNotification,
+    /// The instance is waiting for a message to be delivered to it.
     // TODO: never constructed yet, as message delivery isn't implemented
     #[expect(dead_code)]
-    Resume(Option<low_level_vm::Value>),
+    WaitingForMessage,
 }
 
 /// Instantiated [`Module`].
@@ -87,8 +92,6 @@ struct Instance<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Alloca
         TMemAlloc,
     >,
     /// Imported functions of the module, ordered by import index. See [`Module::imports`].
-    // TODO: not used yet, as message delivery isn't implemented
-    #[expect(dead_code)]
     imports: Arc<[ModuleImport]>,
     /// Public key of the instance.
     // TODO: not used yet
@@ -121,7 +124,10 @@ impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
 
         let mut outcome = match status {
             ReadyStatus::NotStarted => instance.vm.call("main", &[]),
-            ReadyStatus::Resume(value) => instance.vm.resume(value),
+            // TODO: message delivery isn't implemented, the instance is currently destroyed
+            ReadyStatus::SendingRequest
+            | ReadyStatus::SendingNotification
+            | ReadyStatus::WaitingForMessage => return,
         };
 
         loop {
@@ -129,9 +135,18 @@ impl<TCodeAlloc: Allocator, TStackAlloc: Allocator, TMemAlloc: Allocator>
                 // TODO: report the error somehow
                 Err(_) => return,
                 Ok(low_level_vm::RunOutcome::Return(_)) => return,
-                Ok(low_level_vm::RunOutcome::ImportCall { .. }) => {
-                    // TODO: the instance is currently destroyed, as message delivery isn't
-                    // implemented
+                Ok(low_level_vm::RunOutcome::ImportCall { import, .. }) => {
+                    // The low-level VM only reports imports that exist in the module, and
+                    // `instance.imports` contains all the imports of the module.
+                    let import = usize::try_from(import)
+                        .ok()
+                        .and_then(|import| instance.imports.get(import))
+                        .unwrap_or_else(|| unreachable!());
+                    let status = match import {
+                        ModuleImport::Request { .. } => ReadyStatus::SendingRequest,
+                        ModuleImport::Notification { .. } => ReadyStatus::SendingNotification,
+                    };
+                    self.ready.push(ReadyInstance { instance, status });
                     return;
                 }
                 Ok(low_level_vm::RunOutcome::MemoryGrow { delta }) => {
