@@ -2,11 +2,21 @@ use core::fmt;
 use std::{fs, io, path::Path};
 
 pub fn build_disk_image(
+    multi: &indicatif::MultiProgress,
     kernel_file_path: impl AsRef<Path>,
     init_program_path: impl AsRef<Path>,
     wasm_programs: impl Iterator<Item = ([u8; 32], impl AsRef<Path>)>,
     disk_image_path: impl AsRef<Path>,
 ) -> Result<(), io::Error> {
+    let bar = multi.add(indicatif::ProgressBar::new_spinner());
+    bar.set_style(
+        indicatif::ProgressStyle::with_template("{spinner:.green} {prefix:>14.bold} {wide_msg}")
+            .unwrap_or_else(|_| unreachable!()),
+    );
+    bar.set_prefix("Disk image");
+    bar.enable_steady_tick(core::time::Duration::from_millis(100));
+    bar.set_message("creating partitions");
+
     let mut file = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -57,6 +67,7 @@ pub fn build_disk_image(
             (start_sector + sectors_length) * 512,
         )?;
 
+        bar.set_message("formatting");
         fatfs::format_volume(
             &mut partition_slice,
             fatfs::FormatVolumeOptions::new()
@@ -74,9 +85,11 @@ pub fn build_disk_image(
                 let root_dir = fs.root_dir();
                 let efi_dir = root_dir.create_dir("EFI")?;
                 let boot_dir = efi_dir.create_dir("BOOT")?;
+                bar.set_message("writing kernel");
                 let mut kernel_writer = boot_dir.create_file("BOOTX64.EFI")?;
                 io::copy(&mut fs::File::open(kernel_file_path)?, &mut kernel_writer)?;
 
+                bar.set_message("writing initramfs");
                 let mut initramfs_writer = root_dir.create_file("initramfs.cpio.gz")?;
                 let init_program = fs::read(init_program_path)?;
                 io::Write::write_all(&mut initramfs_writer, &initramfs(&init_program))?;
@@ -89,6 +102,7 @@ pub fn build_disk_image(
                     }
                     file_name.push_str(".wasm");
 
+                    bar.set_message(format!("writing {file_name}"));
                     let mut program_writer = root_dir.create_file(&file_name)?;
                     io::copy(&mut fs::File::open(program_path)?, &mut program_writer)?;
                 }
@@ -102,6 +116,7 @@ pub fn build_disk_image(
 
     io::Write::flush(&mut file)?;
     file.sync_data()?;
+    bar.finish_with_message("done");
     Ok(())
 }
 

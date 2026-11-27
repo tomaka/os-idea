@@ -1,3 +1,4 @@
+use crate::cargo;
 use std::{fs, path::Path, path::PathBuf, process};
 
 /// Configuration passed to [`build_init`].
@@ -19,7 +20,15 @@ pub struct Config {
 /// # Panic
 ///
 /// Panics if creating the temporary project fails or if the build fails.
-pub fn build_init(config: Config) -> PathBuf {
+pub fn build_init(multi: &indicatif::MultiProgress, config: Config) -> PathBuf {
+    let bar = multi.add(indicatif::ProgressBar::new_spinner());
+    bar.set_style(
+        indicatif::ProgressStyle::with_template("{spinner:.green} {prefix:>14.bold} {wide_msg}")
+            .unwrap_or_else(|_| unreachable!()),
+    );
+    bar.set_prefix("init");
+    bar.enable_steady_tick(core::time::Duration::from_millis(100));
+
     let project_root = Path::new(&env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(1)
@@ -74,21 +83,25 @@ pub fn build_init(config: Config) -> PathBuf {
     fs::copy(init_dir.join("Cargo.lock"), tmp.path().join("Cargo.lock"))
         .unwrap_or_else(|err| panic!("failed to copy Cargo.lock: {err}"));
 
-    let status = process::Command::new(env!("CARGO"))
-        .current_dir(tmp.path())
-        .arg("build")
-        .args(["--target", "x86_64-unknown-linux-musl"])
-        .arg("--target-dir")
-        .arg(&target_dir)
-        // Cargo looks for configuration files starting from the current directory, which is
-        // the temporary directory, so the configuration of `init` must be passed explicitly.
-        .arg("--config")
-        .arg(init_dir.join(".cargo").join("config.toml"))
-        .status()
-        .unwrap_or_else(|err| panic!("failed to run cargo: {err}"));
+    let status = cargo::run(
+        multi,
+        &bar,
+        process::Command::new(env!("CARGO"))
+            .current_dir(tmp.path())
+            .arg("build")
+            .args(["--target", "x86_64-unknown-linux-musl"])
+            .arg("--target-dir")
+            .arg(&target_dir)
+            // Cargo looks for configuration files starting from the current directory, which is
+            // the temporary directory, so the configuration of `init` must be passed explicitly.
+            .arg("--config")
+            .arg(init_dir.join(".cargo").join("config.toml")),
+    );
     if !status.success() {
+        bar.abandon_with_message("failed");
         panic!("cargo build failed");
     }
+    bar.finish_with_message("done");
 
     target_dir
         .join("x86_64-unknown-linux-musl")

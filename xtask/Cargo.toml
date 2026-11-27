@@ -12,6 +12,7 @@ flate2 = "1.0"
 fscommon = "0.1.1"
 futures-util = "0.3.32"
 gpt = "4.0"
+indicatif = "0.18"
 interface-bindings = { path = "../interface-bindings" }
 rand = "0.10.3"
 tar = "0.4.45"

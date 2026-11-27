@@ -21,8 +21,18 @@ use std::{
 /// configuration).
 ///
 /// Returns the path to the `bzImage`.
-pub fn build_kernel(project_root: impl AsRef<Path>) -> Result<PathBuf, io::Error> {
+pub fn build_kernel(
+    multi: &indicatif::MultiProgress,
+    project_root: impl AsRef<Path>,
+) -> Result<PathBuf, io::Error> {
     let project_root = project_root.as_ref();
+    let bar = multi.add(indicatif::ProgressBar::new_spinner());
+    bar.set_style(
+        indicatif::ProgressStyle::with_template("{spinner:.green} {prefix:>14.bold} {wide_msg}")
+            .unwrap_or_else(|_| unreachable!()),
+    );
+    bar.set_prefix("Linux kernel");
+    bar.enable_steady_tick(core::time::Duration::from_millis(100));
     let out_dir = project_root.join("target").join("kernel");
     let kernel_tar = project_root.join("xtask").join("linux-7.0.tar.gz");
     let artifacts = out_dir.join("build-artifacts.tar.gz");
@@ -37,6 +47,7 @@ pub fn build_kernel(project_root: impl AsRef<Path>) -> Result<PathBuf, io::Error
             .join("build_kernel.rs"),
     ];
     if is_up_to_date(&bzimage, &inputs)? {
+        bar.finish_with_message("up to date");
         return Ok(bzimage);
     }
 
@@ -47,8 +58,11 @@ pub fn build_kernel(project_root: impl AsRef<Path>) -> Result<PathBuf, io::Error
             .expect("Failed to connect to Docker daemon");
 
         // TODO: better image tag? don't use a tag at all?
-        build_image(&docker, "kernel-builder:latest".to_string()).await?;
+        bar.set_message("building Docker image");
+        build_image(&bar, &docker, "kernel-builder:latest".to_string()).await?;
+        bar.set_message("building kernel");
         actually_build_kernel(
+            &bar,
             &docker,
             &kernel_tar,
             &artifacts,
@@ -59,9 +73,11 @@ pub fn build_kernel(project_root: impl AsRef<Path>) -> Result<PathBuf, io::Error
 
     // The `bzImage` acts as the stamp file and is thus written last, atomically, so that an
     // interrupted build never leaves an up-to-date-looking `bzImage`.
+    bar.set_message("extracting bzImage");
     let tmp = out_dir.join("bzImage.tmp");
     extract_specific_file(&artifacts, "arch/x86/boot/bzImage", &tmp)?;
     fs::rename(&tmp, &bzimage)?;
+    bar.finish_with_message("done");
 
     Ok(bzimage)
 }
@@ -89,7 +105,14 @@ fn is_up_to_date(output: &Path, inputs: &[PathBuf]) -> Result<bool, io::Error> {
 ///
 /// Assumes that we are within tokio, which we are because this is a private function not
 /// called from outside this module.
-async fn build_image(docker: &bollard::Docker, image_tag: String) -> Result<(), io::Error> {
+///
+/// The output of the build is passed through `multi`, and each line is also shown as the
+/// message of `bar`.
+async fn build_image(
+    bar: &indicatif::ProgressBar,
+    docker: &bollard::Docker,
+    image_tag: String,
+) -> Result<(), io::Error> {
     let mut header = tar::Header::new_gnu();
     header.set_size(0);
     header.set_cksum();
@@ -122,7 +145,16 @@ async fn build_image(docker: &bollard::Docker, image_tag: String) -> Result<(), 
             None,
             Some(bollard::body_full(tar_data.into())),
         ),
-        |_info| async move { Ok(()) },
+        |info| async move {
+            for line in info.stream.as_deref().unwrap_or("").lines() {
+                let line = line.trim_end();
+                if line.is_empty() {
+                    continue;
+                }
+                bar.set_message(format!("Docker image: {}", line.trim_start()));
+            }
+            Ok(())
+        },
     )
     .await
     {
@@ -143,7 +175,11 @@ async fn build_image(docker: &bollard::Docker, image_tag: String) -> Result<(), 
 ///
 /// The `kernel_tar_path` is assumed to contain a directory that contains the actual source code.
 /// This is because this is what GitHub gives you when you download a `.tar` of source code.
+///
+/// The output of the container is passed through `multi`, and each line is also shown as the
+/// message of `bar`.
 async fn actually_build_kernel(
+    bar: &indicatif::ProgressBar,
     docker: &bollard::Docker,
     kernel_tar_path: impl AsRef<Path>,
     build_artifacts_path: impl AsRef<Path>,
@@ -219,6 +255,29 @@ async fn actually_build_kernel(
                 )
                 .await;
             panic!("{err}"); // TODO: don't panic?
+        }
+    }
+
+    // Pass through the output of the container until it finishes executing its command.
+    let mut logs = docker.logs(
+        &container_id,
+        Some(bollard::query_parameters::LogsOptions {
+            follow: true,
+            stdout: true,
+            stderr: true,
+            ..Default::default()
+        }),
+    );
+    let mut pending_output = Vec::new();
+    while let Some(output) = futures_util::StreamExt::next(&mut logs).await {
+        let Ok(output) = output else { break };
+        pending_output.extend_from_slice(&output.into_bytes());
+        while let Some(newline_pos) = pending_output.iter().position(|b| *b == b'\n') {
+            let line = String::from_utf8_lossy(&pending_output[..newline_pos])
+                .trim_end()
+                .to_owned();
+            pending_output.drain(..=newline_pos);
+            bar.set_message(line.trim_start().to_owned());
         }
     }
 
