@@ -27,7 +27,7 @@ fn main() {
         bzimage,
         init,
         wasm_programs.into_iter(),
-        "image.img",
+        project_root.join("target").join("image.img"),
     )
     .unwrap();
 }
