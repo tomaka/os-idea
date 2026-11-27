@@ -198,7 +198,7 @@ fn generate(
 ) -> Result<TokenStream, String> {
     let import_module = hash
         .iter()
-        .fold(String::from("interface_"), |mut name, byte| {
+        .fold(String::from("interface-"), |mut name, byte| {
             name.push_str(&format!("{byte:02x}"));
             name
         });
